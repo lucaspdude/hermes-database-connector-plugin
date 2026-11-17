@@ -192,12 +192,12 @@ def execute(
         _read_only_transaction(client, cursor, statement_timeout_for(client, statement_timeout_s))
         started = time.perf_counter()
         cursor.execute(statement)
-        rows = _fetch_limited(cursor, limit)
+        rows, fetched = _fetch_limited(cursor, limit)
         duration_ms = int(round((time.perf_counter() - started) * 1000))
         return {
             "rows": rows,
             "row_count": len(rows),
-            "truncated": _row_truncated(cursor, limit, len(rows)),
+            "truncated": fetched > limit,
             "duration_ms": duration_ms,
             "server_version": server_version(client),
         }
@@ -275,27 +275,21 @@ def _read_only_transaction(client: Any, cursor: Any, statement_timeout_s: float 
     cursor.execute(READ_ONLY_STATEMENT)
 
 
-def _fetch_limited(cursor: Any, limit: int) -> list[list[Any]]:
-    """Fetch at most ``limit`` rows, as lists (JSON-friendly and uniform)."""
+def _fetch_limited(cursor: Any, limit: int) -> tuple[list[list[Any]], int]:
+    """``(rows, fetched)`` — at most ``limit`` rows, plus the raw fetch size.
+
+    Truncation comes from that raw size and never from ``cursor.rowcount``
+    (which is ``-1`` in psycopg v3 for a plain ``SELECT``): exactly ``limit``
+    rows and nothing else in the cursor is **not** truncated.
+    """
     try:
-        fetched = cursor.fetchmany(limit + 1)  # +1 to detect truncation
+        fetched = list(cursor.fetchmany(limit + 1) or ())  # +1 detects truncation
     except Exception:  # noqa: BLE001 - driver without fetchmany
-        fetched = cursor.fetchall()
+        fetched = list(cursor.fetchall() or ())
     rows: list[list[Any]] = []
-    for row in fetched or ():
+    for row in fetched:
         rows.append(list(row) if not isinstance(row, (str, bytes)) else [row])
-    return rows[:limit]
-
-
-def _row_truncated(cursor: Any, limit: int, delivered: int) -> bool:
-    """True when there were more rows than ``limit``."""
-    try:
-        count = int(getattr(cursor, "rowcount", -1) or -1)
-    except Exception:  # noqa: BLE001
-        count = -1
-    if count > limit:
-        return True
-    return delivered >= limit and count != limit
+    return rows[:limit], len(fetched)
 
 
 def _cleanup(client: Any, cursor: Any) -> None:

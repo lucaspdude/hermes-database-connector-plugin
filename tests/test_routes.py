@@ -663,6 +663,14 @@ def test_failing_emitter_never_breaks_the_crud_response(client):
     assert service.get_connection(conn, "prod-sqlserver") is None
 
 
+def test_primeira_fonte_de_broadcast_e_o_caminho_real_do_host():
+    """P1a: ``hermes_cli.plugin_events`` vem antes dos caminhos antigos."""
+    assert plugin_api.BROADCAST_SOURCES[0] == (
+        "hermes_cli.plugin_events",
+        "broadcast_plugin_event",
+    )
+
+
 def test_emitter_is_resolved_lazily_from_the_host_module(client, monkeypatch):
     """Sem emissor injetado cai no ``broadcast_plugin_event`` do host (lazy)."""
     import sys

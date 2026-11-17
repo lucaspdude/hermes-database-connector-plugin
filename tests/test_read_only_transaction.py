@@ -6,11 +6,18 @@ leitura: uma escrita disfarçada de CTE (``WITH x AS (...) DELETE FROM ...``)
 (task 1.2) e no SQL Server (task 1.5) — que faz o próprio banco recusar a
 operação, e é isso que estes testes cobrem, nas duas engines.
 
-Os fakes de psycopg e pymssql simulam o servidor: depois de ``SET TRANSACTION
-READ ONLY`` qualquer escrita levanta o erro que o banco real levantaria e
-**nada é mutado** (``mutations`` continua vazio e as linhas seguem intactas).
-Sem a declaração, a mesma statement mutaria a "tabela" do fake — é esse
-contraste que prova o efeito da transação.
+Os fakes de psycopg e pymssql simulam o servidor: no PostgreSQL, depois de
+``SET TRANSACTION READ ONLY`` qualquer escrita levanta o erro que o banco real
+levantaria e **nada é mutado** (``mutations`` continua vazio e as linhas seguem
+intactas). Sem a declaração, a mesma statement mutaria a "tabela" do fake — é
+esse contraste que prova o efeito da transação.
+
+No SQL Server **não existe** ``SET TRANSACTION READ ONLY`` (task 1.5): enviá-la
+faria o servidor devolver erro de sintaxe em toda consulta, e por isso a
+declaração nunca é emitida (teste negativo). Aqui o fake T-SQL falha se a
+receber e recusa a escrita porque simula a **credencial somente-leitura** —
+pré-requisito de uso e garantia primária desta engine (README/``Política
+read-only``).
 
 Não há servidor nem driver real aqui: a validação contra instâncias reais
 segue pendente (host ``hostgator``/bateria).
@@ -62,12 +69,16 @@ class _ServerCursor:
         text = str(statement).strip()
         upper = text.upper()
         if upper.startswith("SET TRANSACTION READ ONLY"):
+            if client.tsql:
+                # T-SQL nao tem a declaracao: um SQL Server real devolveria
+                # erro de sintaxe — 1.5 prova que ela nunca é enviada.
+                raise RuntimeError(sqlserver.READ_ONLY_TSQL_ERROR)
             client.read_only = True
             return
         if upper.startswith("SET STATEMENT_TIMEOUT"):
             return
         if _is_write(text):
-            if client.read_only:
+            if client.read_only or client.read_only_login:
                 # É o banco recusando, não o plugin: sem READ ONLY mutaria.
                 raise RuntimeError(READ_ONLY_VIOLATION)
             client.mutations.append(text)
@@ -93,9 +104,18 @@ class _ServerCursor:
 class _ServerClient:
     """Cliente falso: guarda o que foi executado e o que foi mutado."""
 
-    def __init__(self, rows=(("10", "aberto"), ("20", "pago")), version="17.2"):
+    def __init__(
+        self,
+        rows=(("10", "aberto"), ("20", "pago")),
+        version="17.2",
+        *,
+        tsql: bool = False,
+        read_only_login: bool = False,
+    ):
         self.rows = [list(row) for row in rows]
         self.server_version = version
+        self.tsql = tsql  # servidor T-SQL: recusa a declaracao READ ONLY
+        self.read_only_login = read_only_login  # credencial somente-leitura
         self.executed: list[str] = []
         self.mutations: list[str] = []
         self.read_only = False
@@ -142,7 +162,12 @@ def pg_server():
 
 @pytest.fixture()
 def mssql_server():
-    client = _ServerClient(rows=(("10", "aberto"),), version="16.0.1000")
+    client = _ServerClient(
+        rows=(("10", "aberto"),),
+        version="16.0.1000",
+        tsql=True,
+        read_only_login=True,  # garantia primaria: credencial somente-leitura
+    )
     sqlserver.set_driver_module(_FakeLib(client), optional=None)
     sqlserver._pyodbc_preferred = False
     yield client
@@ -232,15 +257,24 @@ def test_postgres_sem_read_only_a_escrita_teria_efeito():
 # --------------------------------------------------------------------------
 
 
-def test_sqlserver_read_only_vem_antes_e_o_banco_recusa_sem_efeito(mssql_server):
+def test_fake_sqlserver_falha_se_receber_a_declaracao(mssql_server):
+    """Negativo de 1.5: o servidor T-SQL recusa ``SET TRANSACTION READ ONLY``."""
+    with pytest.raises(RuntimeError) as caught:
+        mssql_server.cursor().execute(sqlserver.READ_ONLY_STATEMENT)
+
+    assert sqlserver.READ_ONLY_TSQL_ERROR in str(caught.value)
+
+
+def test_sqlserver_nao_envia_a_declaracao_e_o_banco_recusa_sem_efeito(mssql_server):
+    """1.5/3.6: nenhuma declaração é enviada; quem recusa é a credencial."""
     expected_rows = [list(row) for row in mssql_server.rows]
 
     with pytest.raises(RuntimeError) as caught:
         sqlserver.execute(mssql_server, DISGUISED_STATEMENT, 200)
 
-    read_only_at = mssql_server.first_execution_of(sqlserver.READ_ONLY_STATEMENT)
-    statement_at = mssql_server.first_execution_of("DELETE FROM pedidos")
-    assert read_only_at < statement_at
+    # nenhuma declaração READ ONLY chegou ao servidor (T-SQL não a tem)
+    assert sqlserver.READ_ONLY_STATEMENT not in mssql_server.executed
+    assert mssql_server.first_execution_of("DELETE FROM pedidos") == 0
     assert READ_ONLY_VIOLATION in str(caught.value)
     assert mssql_server.mutations == []
     assert mssql_server.rows == expected_rows
@@ -294,9 +328,8 @@ def test_tool_sqlserver_devolve_db_error_sem_efeito(db, mssql_server):
     assert answer["ok"] is False
     assert answer["code"] == service.CODE_DB_ERROR
     assert READ_ONLY_VIOLATION in answer["error"]
-    assert mssql_server.first_execution_of(
-        sqlserver.READ_ONLY_STATEMENT
-    ) < mssql_server.first_execution_of("DELETE FROM pedidos")
+    # nada de declaração READ ONLY: T-SQL não a tem (quem recusa é a credencial)
+    assert sqlserver.READ_ONLY_STATEMENT not in mssql_server.executed
     assert mssql_server.mutations == []
     assert mssql_server.rows == expected_rows
     assert mssql_server.rollbacks == 1

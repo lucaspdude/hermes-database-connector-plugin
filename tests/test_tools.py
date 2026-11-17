@@ -94,6 +94,7 @@ class _FakeCtx:
 
     def __init__(self, store_conn=None, settings=None, secrets=None):
         self.registrations = []
+        self.skills = []
         self.store_conn = store_conn
         self.settings = settings or {"log_statement": True}
         self.secrets = secrets or {}
@@ -114,6 +115,10 @@ class _FakeCtx:
         return True
 
     # -- o que register chama --------------------------------------------
+    def register_skill(self, name, path):
+        self.skills.append((name, str(path)))
+        return name
+
     def register_tool(self, **kwargs):
         self.registrations.append(kwargs)
         return kwargs["name"]
@@ -276,6 +281,54 @@ def test_check_fn_com_conexao_habilitada_sinaliza_ok(db, stored):
 
     service.upsert_connection(db, _row(id="prod-sqlserver", enabled=0))
     assert tools.check_connections_configured() is False  # nenhuma habilitada
+
+
+def _load_root_package():
+    """O pacote raiz do plugin (o diretorio nao e um identificador valido)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "database_connector_plugin", ROOT / "__init__.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_register_registra_a_skill_embarcada(tmp_path):
+    """P1b: ``register(ctx)`` registra cada skill de ``skills/*/SKILL.md``."""
+    plugin = _load_root_package()
+    ctx = _FakeCtx(store_conn=service.open_store(str(tmp_path / "register.db")))
+
+    plugin.register(ctx)
+
+    assert [name for name, _path in ctx.skills] == ["database-connector"]
+    name, path = ctx.skills[0]
+    assert path.endswith("SKILL.md")
+    expected = ROOT / "skills" / name / "SKILL.md"
+    assert pathlib.Path(path) == expected
+    assert expected.exists()
+    # a skill nao atrapalha as tools
+    assert [call["name"] for call in ctx.registrations] == [
+        "db_list_connections",
+        "db_query",
+        "db_redis_command",
+    ]
+
+
+def test_register_de_um_ctx_sem_register_skill_nao_quebra(tmp_path):
+    """P1b: host sem ``register_skill`` continua registrando as tools."""
+
+    class _CtxSemSkill(_FakeCtx):
+        register_skill = None
+
+    plugin = _load_root_package()
+    ctx = _CtxSemSkill(store_conn=service.open_store(str(tmp_path / "register.db")))
+
+    plugin.register(ctx)
+
+    assert ctx.skills == []
+    assert len(ctx.registrations) == 3
 
 
 def test_register_pluga_store_config_e_registra_as_tres_tools(db, tmp_path):
@@ -720,6 +773,7 @@ def test_comandos_da_allowlist_executam(db, redis_row, command):
     ["FLUSHALL", "FLUSHDB", "EVAL", "SCRIPT", "KEYS", "CONFIG", "AUTH", "SET", "DEL", "MEMORY", "OBJECT", "CLIENT", "DEBUG", "SHUTDOWN", "CLUSTER", "REPLICAOF"],
 )
 def test_comando_fora_da_allowlist_e_recusado_sem_tocar_servidor(db, redis_row, command):
+    """P2a: a recusa da allowlist passa pelo ciclo como recusa de política."""
     client = _FakeRedisClient()
     emitter = _Recorder()
 
@@ -733,8 +787,12 @@ def test_comando_fora_da_allowlist_e_recusado_sem_tocar_servidor(db, redis_row, 
     assert answer["ok"] is False
     assert answer["code"] == "read_only"
     assert client.calls == []  # nenhum contato com o servidor
-    assert _lines(db) == []  # nem linha "running"
-    assert emitter.events == []
+    # linha error no log + query.failed com o code da política (como no SQL)
+    lines = _lines(db)
+    assert len(lines) == 1
+    assert lines[0]["status"] == "error"
+    assert "allowlist" in (lines[0]["error"] or "")
+    assert emitter.names() == ["query.started", "query.failed"]
 
 
 def test_comando_minusculo_e_normalizado(db, redis_row):
@@ -747,8 +805,17 @@ def test_comando_minusculo_e_normalizado(db, redis_row):
 
 
 def test_comando_vazio_e_recusado(db, redis_row):
-    answer = tools.db_redis_command({"connection_id": "cache-redis", "command": ""}, store=db)
+    client = _FakeRedisClient()
+    answer = tools.db_redis_command(
+        {"connection_id": "cache-redis", "command": ""},
+        store=db,
+        registry=DriverRegistry(overrides={"redis": _FakeRedisLib(client)}),
+    )
     assert answer["code"] == "read_only"
+    assert client.calls == []
+    lines = _lines(db)
+    assert len(lines) == 1
+    assert lines[0]["status"] == "error"
 
 
 def test_redis_valor_truncado_em_64_kib(db, redis_row):

@@ -128,15 +128,13 @@ def configure(ctx: Any) -> Any:
     The path is resolved here, once (``service.init_store``): from then on each
     request opens its own connection and nothing shares the store.
 
-    When ``ctx`` exposes ``broadcast_plugin_event`` it becomes the emitter of
-    ``connection.changed`` (task 4.6); otherwise the lazy resolution in
-    :func:`resolve_broadcast` takes over.
+    The emitter of ``connection.changed`` is the host's real
+    ``broadcast_plugin_event``, resolved lazily by :func:`resolve_broadcast`
+    (task P1a): ``ctx`` does **not** expose the callable, so there is nothing to
+    take from it here.
     """
     store = service.init_store(ctx)
     set_store(store)
-    candidate = getattr(ctx, "broadcast_plugin_event", None)
-    if callable(candidate):
-        set_connection_change_emitter(candidate)
     return store
 
 
@@ -181,6 +179,8 @@ def get_connection_change_emitter() -> Callable[..., Any] | None:
 #: import is **lazy** (inside the emit) because none of these modules exists
 #: outside a running Hermes — importing at module load would break the plugin.
 BROADCAST_SOURCES: tuple[tuple[str, str], ...] = (
+    # caminho real do host (confirmado no checkout do Hermes): primeiro
+    ("hermes_cli.plugin_events", "broadcast_plugin_event"),
     ("hermes.gateway.events", "broadcast_plugin_event"),
     ("hermes.gateway", "broadcast_plugin_event"),
     ("hermes.events", "broadcast_plugin_event"),
@@ -189,7 +189,11 @@ BROADCAST_SOURCES: tuple[tuple[str, str], ...] = (
 
 
 def resolve_broadcast() -> Callable[..., Any] | None:
-    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes."""
+    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes.
+
+    Task P1a: ``hermes_cli.plugin_events`` is the path the host really exposes,
+    so it comes first; the others stay as fallbacks for older builds.
+    """
     for module_name, attribute in BROADCAST_SOURCES:
         try:
             module = importlib.import_module(module_name)

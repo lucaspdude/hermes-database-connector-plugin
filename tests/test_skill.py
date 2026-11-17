@@ -65,6 +65,15 @@ def test_corpo_explica_os_codes_e_os_limites():
     assert "10 s" in body and "30 s" in body  # timeouts padrão
 
 
+def test_corpo_documenta_a_recusa_conservadora_de_literais():
+    """P2d: `;` ou `--` dentro de literal e recusado (falso positivo seguro)."""
+    _front, body = _load()
+
+    assert "Recusa conservadora" in body or "recusa conservadora" in body
+    assert "literal" in body
+    assert "não existe" in body or "nao existe" in body  # T-SQL sem READ ONLY
+
+
 def test_corpo_traz_exemplo_de_fluxo_listar_consultar_interpretar():
     _front, body = _load()
 

@@ -62,18 +62,28 @@ class _FakeCursor:
         self.client.cursors_closed += 1
 
 
+class _UnknownRowcountCursor(_FakeCursor):
+    """P2c: psycopg reports ``rowcount == -1`` for a plain ``SELECT``."""
+
+    def fetchmany(self, size):
+        got = self.rows[:size]
+        self.rowcount = -1
+        return got
+
+
 class _FakeClient:
-    def __init__(self, rows=(), version="17.2", raises_on=None):
+    def __init__(self, rows=(), version="17.2", raises_on=None, unknown_rowcount=False):
         self.rows = [list(row) for row in rows]
         self.server_version = version
         self.raises_on = raises_on
+        self.unknown_rowcount = unknown_rowcount
         self.executed: list[str] = []
         self.rollbacks = 0
         self.cursors_closed = 0
         self.closed = False
 
     def cursor(self):
-        return _FakeCursor(self)
+        return _UnknownRowcountCursor(self) if self.unknown_rowcount else _FakeCursor(self)
 
     def rollback(self):
         self.rollbacks += 1
@@ -167,6 +177,32 @@ def test_execute_limits_rows_and_flags_truncation():
 
     assert result["rows"] == [[0], [1]]
     assert result["row_count"] == 2
+    assert result["truncated"] is True
+
+
+def test_execute_nao_marca_truncado_com_rowcount_negativo_e_exatamente_n_linhas():
+    """P2c: ``truncated`` vem do tamanho bruto do fetch, não de ``rowcount``.
+
+    Exatamente ``max_rows`` linhas e nada depois delas **não** é truncamento,
+    mesmo com ``rowcount == -1`` (o que psycopg reporta num SELECT simples).
+    """
+    client = _FakeClient(rows=[(i,) for i in range(3)], unknown_rowcount=True)
+    _install(client)
+
+    result = postgres.execute(client, "SELECT * FROM t", 3)
+
+    assert result["rows"] == [[0], [1], [2]]
+    assert result["row_count"] == 3
+    assert result["truncated"] is False
+
+
+def test_execute_com_rowcount_negativo_e_mais_linhas_marca_truncado():
+    client = _FakeClient(rows=[(i,) for i in range(5)], unknown_rowcount=True)
+    _install(client)
+
+    result = postgres.execute(client, "SELECT * FROM big", 3)
+
+    assert result["row_count"] == 3
     assert result["truncated"] is True
 
 

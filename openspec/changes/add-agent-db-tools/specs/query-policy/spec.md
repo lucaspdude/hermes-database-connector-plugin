@@ -28,16 +28,16 @@ A tool SHALL recusar statement contendo `;` seguido de outra statement e coment�
 - **WHEN** a statement contém `--` ou `/* */`
 - **THEN** responde `{ ok: false, code: "read_only" }` sem executar nada
 
-### Requirement: Transação READ ONLY no PostgreSQL e SQL Server
-Consultas PostgreSQL SHALL executar dentro de transação `READ ONLY` com `statement_timeout` aplicado, e consultas SQL Server SHALL executar com `SET TRANSACTION READ ONLY` na conexão (caminho pymssql), de modo que formas que o filtro de palavra-chave não captura (`WITH ... DELETE`, `SELECT ... INTO`, funções com efeito colateral) sejam barradas pelo próprio banco nas duas engines.
+### Requirement: Transação READ ONLY no PostgreSQL
+Consultas PostgreSQL SHALL executar dentro de transação `READ ONLY` com `statement_timeout` aplicado, de modo que formas que o filtro de palavra-chave não captura (`WITH ... DELETE`, `SELECT ... INTO`, funções com efeito colateral) sejam barradas pelo próprio banco. O SQL Server NÃO possui transação somente-leitura em T-SQL (`SET TRANSACTION` aceita apenas `ISOLATION LEVEL`): nessa engine, a garantia contra escrita disfarçada é a credencial somente-leitura documentada como pré-requisito de uso, combinada com o filtro da tool e os timeouts — e o driver SHALL NEVER emitir `SET TRANSACTION READ ONLY`.
 
 #### Scenario: Escrita disfarçada barrada pelo PostgreSQL
 - **WHEN** uma statement `WITH ... DELETE` passa pelo filtro e chega ao PostgreSQL
 - **THEN** a transação READ ONLY faz o banco recusar a operação, e a tool devolve erro sem efeito no banco
 
-#### Scenario: Escrita disfarçada barrada pelo SQL Server
-- **WHEN** uma statement `WITH ... DELETE` passa pelo filtro e chega ao SQL Server
-- **THEN** a transação READ ONLY faz o banco recusar a operação, e a tool devolve erro sem efeito no banco
+#### Scenario: SQL Server sem declaração inválida
+- **WHEN** uma consulta SQL Server legítima é executada
+- **THEN** o driver não envia `SET TRANSACTION READ ONLY` (inexistente em T-SQL), a consulta executa normalmente, e a garantia de somente-leitura é a credencial de banco documentada como pré-requisito
 
 ### Requirement: Timeouts e limites
 Toda conexão SHALL aplicar timeout de conexão (padrão 10 s) e de statement (padrão 30 s), configuráveis por conexão; `max_rows` SHALL ter padrão 200 e teto 1000; o valor retornado por comando Redis SHALL vir truncado em 64 KiB. Timeout SHALL mapear para `code: "timeout"` sem deixar linha "running" órfã.

@@ -26,10 +26,12 @@ retornado. A lista nunca traz `secret_ref`, usuário ou senha.
    comentário (`--`, `/* */`); `db_redis_command` só aceita a allowlist. Essa
    camada **não pega todas** as formas de escrita — `WITH ... DELETE`,
    `SELECT ... INTO` e `EXEC` passam por ela.
-3. **Terceira camada — a transação `READ ONLY`.** Por isso toda consulta roda
-   dentro de `SET TRANSACTION READ ONLY` (PostgreSQL e SQL Server, caminho
-   pymssql): o **próprio banco** recusa a escrita que escapou do filtro e nada é
-   aplicado (rollback ao final, sempre).
+3. **Terceira camada — a transação `READ ONLY` (PostgreSQL).** Toda consulta
+   roda dentro de `SET TRANSACTION READ ONLY`: o **próprio banco** recusa a
+   escrita que escapou do filtro e nada é aplicado (rollback ao final, sempre).
+   No **SQL Server** essa declaração não existe em T-SQL (quebraria toda
+   consulta com erro de sintaxe), então a garantia é a **credencial
+   somente-leitura** — sempre a primária.
 
 ## Limites
 
@@ -37,6 +39,11 @@ retornado. A lista nunca traz `secret_ref`, usuário ou senha.
 - Redis: o valor volta truncado em **64 KiB** (`truncated: true`).
 - Timeout de conexão **10 s** e de statement **30 s** (padrões; configuráveis
   por conexão em `options.connect_timeout_s` / `options.statement_timeout_s`).
+- **Recusa conservadora (limitação conhecida):** a detecção de lote e de
+  comentário é textual, então statements com `;` ou `--` **dentro de um
+  literal** (ex.: `WHERE nome = 'a;b'`) são recusadas com `code: "read_only"`
+  mesmo sendo leitura pura. É um falso positivo seguro: reescreva a consulta
+  (use parâmetro ou mude o literal).
 
 ## Códigos de erro — o que cada um significa e o que fazer
 

@@ -313,6 +313,20 @@ def sql_read_only_guard(**cycle: Any) -> None:
         raise QueryPolicyError(reason)
 
 
+def redis_read_only_guard(**cycle: Any) -> None:
+    """``guard`` of the Redis cycle: refuse a command outside the allowlist.
+
+    Same shape as :func:`sql_read_only_guard` (task P2a, spec ``activity-log``:
+    "recusada pela política"): the refusal runs **inside** the cycle, already
+    after the ``running`` line and ``query.started``, so the line ends as
+    ``error`` and ``query.failed`` carries ``code: "read_only"`` — logged like
+    any other failure, still without any contact with the server.
+    """
+    reason = redis_command_allowed(cycle.get("statement"))
+    if reason:
+        raise QueryPolicyError(reason)
+
+
 def redis_command_allowed(command: Any) -> str | None:  # noqa: D401
     """Reason why ``command`` is refused (``None`` when it is in the allowlist)."""
     name = str(command or "").strip().upper()
@@ -460,11 +474,6 @@ def db_redis_command(args: Any = None, **kwargs: Any) -> dict[str, Any]:
     params = args_of(args)
     command = str(params.get("command") or "").strip().upper()
 
-    # Allowlist antes de qualquer coisa: sem linha "running", sem servidor.
-    refused = redis_command_allowed(command)
-    if refused:
-        return _failure(service.CODE_READ_ONLY, refused)
-
     store = _provided(kwargs, "store", _store)
     if store is None:
         return _no_store()
@@ -504,6 +513,7 @@ def db_redis_command(args: Any = None, **kwargs: Any) -> dict[str, Any]:
         emitter=_provided(kwargs, "emitter", _event_emitter),
         config_getter=_provided(kwargs, "config_getter", _config_getter),
         driver=kwargs.get("driver"),
+        guard=redis_read_only_guard,
     )
 
     if result.get("ok"):
@@ -647,9 +657,9 @@ def register_tools(ctx: Any) -> list[str]:
     if callable(secret_resolver):
         set_secret_resolver(secret_resolver)
 
-    emitter = getattr(ctx, "broadcast_plugin_event", None)
-    if callable(emitter):
-        set_event_emitter(emitter)
+    # P1a: ``ctx`` nao expoe ``broadcast_plugin_event`` — o emissor dos eventos
+    # de consulta e resolvido sob demanda por ``service.resolve_broadcast``
+    # (``hermes_cli.plugin_events`` primeiro), nunca vindo do ctx.
 
     registered: list[str] = []
     for name, schema, handler in TOOL_DEFINITIONS:

@@ -11,6 +11,8 @@ Eventos reais via ``broadcast_plugin_event`` do host pendentes (hostgator): os
 testes injetam o emissor, com o mesmo padrão do adaptador REST.
 """
 
+import time
+
 import pytest
 from pathlib import Path
 
@@ -112,6 +114,31 @@ class _FakeMssqlLib:
     def connect(self, **kwargs):
         self.kwargs = kwargs
         return self.client
+
+
+class _ClosingClient:
+    """Client that records whether it was released (P2b)."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _SlowConnectAdapter(_FakeAdapter):
+    """Uniform driver whose ``connect`` takes longer than the whole budget."""
+
+    def __init__(self, delay=0.3):
+        super().__init__()
+        self.delay = delay
+        self.opened: list[_ClosingClient] = []
+
+    def connect(self, row, secret_value=None):
+        time.sleep(self.delay)
+        client = _ClosingClient()
+        self.opened.append(client)
+        return client
 
 
 class _Timeout(Exception):
@@ -360,6 +387,51 @@ def test_timeout_no_ciclo_mapeia_para_timeout(db, stored):
     assert result["code"] == "timeout"
     assert emitter.names() == ["query.started", "query.failed"]
     assert _lines(db)[0]["status"] == "error"
+
+
+def _wait_until(condition, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+def test_run_with_deadline_fecha_o_valor_tardio(db):
+    """P2b: o que a thread abandonada produz depois do prazo é liberado."""
+    holder: dict[str, _ClosingClient] = {}
+
+    def slow() -> _ClosingClient:
+        time.sleep(0.3)
+        holder["client"] = _ClosingClient()
+        return holder["client"]
+
+    value, exc = service._run_with_deadline(
+        0.05, slow, on_late_value=service._close_quietly
+    )
+
+    assert isinstance(exc, TimeoutError)
+    assert value is None
+    assert _wait_until(lambda: "client" in holder)
+    assert _wait_until(lambda: holder["client"].closed) is True
+
+
+def test_connect_tardio_e_fechado_quando_o_prazo_estoura(db):
+    """P2b: no ciclo, o cliente do connect que completa depois é fechado."""
+    row = service.upsert_connection(
+        db,
+        _row(id="slow-sql", options={"connect_timeout_s": 0.05, "statement_timeout_s": 20}),
+    )
+    adapter = _SlowConnectAdapter()
+
+    result = service.run_query(db, row, "SELECT 1", resolver=_resolver(), driver=adapter)
+
+    assert result["code"] == "timeout"
+    assert _lines(db)[0]["status"] == "error"
+    # a thread abandonada conclui o connect depois: o cliente não pode vazar
+    assert _wait_until(lambda: bool(adapter.opened))
+    assert _wait_until(lambda: adapter.opened[0].closed) is True
 
 
 def test_segredo_missing_acontece_antes_do_started(db, stored):
@@ -658,10 +730,32 @@ def test_ciclo_sqlserver_pelo_adapter_real_com_biblioteca_fake(db, stored):
 
     assert result["ok"] is True
     assert result["rows"] == [[1, "linha"]]
-    # READ ONLY declarado antes da statement (defesa em profundidade)
-    assert mssql.READ_ONLY_STATEMENT in fake.client.executed
+    # 1.5: T-SQL nao tem a declaracao — nunca enviada ao SQL Server
+    assert mssql.READ_ONLY_STATEMENT not in fake.client.executed
     assert fake.client.rollbacks == 1  # transação nunca fica aberta
     assert _lines(db)[0]["status"] == "ok"
+
+
+def test_resolve_broadcast_encontra_o_emissor_no_caminho_real_do_host(monkeypatch):
+    """P1a: ``hermes_cli.plugin_events`` é o primeiro caminho tentado."""
+    import sys
+    import types
+
+    assert service.BROADCAST_SOURCES[0] == (
+        "hermes_cli.plugin_events",
+        "broadcast_plugin_event",
+    )
+    seen: list[tuple] = []
+    module_name, attribute = service.BROADCAST_SOURCES[0]
+    fake_host = types.ModuleType(module_name)
+    setattr(fake_host, attribute, lambda *args: seen.append(args))
+    monkeypatch.setitem(sys.modules, module_name, fake_host)
+
+    emitter = service.resolve_broadcast()
+
+    assert callable(emitter)
+    emitter("database-connector", "query.started", {"query_id": "q1"})
+    assert seen == [("database-connector", "query.started", {"query_id": "q1"})]
 
 
 def test_toggle_log_statement_esta_declarado_no_config_schema():

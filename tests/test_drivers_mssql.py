@@ -1,5 +1,10 @@
 """Tasks 1.3 e 1.5 — ``drivers/sqlserver.py``: pymssql padrão, pyodbc opcional,
-transação READ ONLY envolvendo a execução.
+sem ``SET TRANSACTION READ ONLY`` (inexistente em T-SQL).
+
+1.5 é um teste **negativo**: o fake de servidor falha se receber a declaração
+(como um SQL Server real faria — erro de sintaxe em toda consulta), e a
+garantia de leitura desta engine é a credencial somente-leitura (pré-requisito
+documentado no README), não uma declaração de transação.
 
 Fakes only: ``pymssql``/``pyodbc`` are not installed here, so no server is
 contacted. The real-instance validation (SQL Server on host ``hostgator``,
@@ -48,6 +53,10 @@ class _FakeCursor:
 
     def execute(self, statement):
         self.client.executed.append(statement)
+        # 1.5: servidor T-SQL real recusa a declaração (sintaxe inexistente) —
+        # o driver nunca pode enviá-la.
+        if "TRANSACTION READ ONLY" in str(statement).upper():
+            raise RuntimeError(sqlserver.READ_ONLY_TSQL_ERROR)
         if self.client.raises_on and self.client.raises_on in statement:
             raise RuntimeError(f"boom: {statement}")
 
@@ -66,11 +75,20 @@ class _FakeCursor:
         self.client.cursors_closed += 1
 
 
+class _UnknownRowcountCursor(_FakeCursor):
+    """P2c: pymssql reports ``rowcount == -1`` for a plain ``SELECT``."""
+
+    def fetchmany(self, size):
+        self.rowcount = -1
+        return self.client.rows[:size]
+
+
 class _FakeClient:
-    def __init__(self, rows=(), version="16.0.1000", raises_on=None):
+    def __init__(self, rows=(), version="16.0.1000", raises_on=None, unknown_rowcount=False):
         self.rows = [list(row) for row in rows]
         self.server_version = version
         self.raises_on = raises_on
+        self.unknown_rowcount = unknown_rowcount
         self.executed: list[str] = []
         self.rollbacks = 0
         self.cursors_closed = 0
@@ -78,7 +96,7 @@ class _FakeClient:
         self.timeout = None
 
     def cursor(self):
-        return _FakeCursor(self)
+        return _UnknownRowcountCursor(self) if self.unknown_rowcount else _FakeCursor(self)
 
     def rollback(self):
         self.rollbacks += 1
@@ -223,22 +241,47 @@ def test_options_can_force_each_path():
 
 
 # --------------------------------------------------------------------------
-# 1.5 SET TRANSACTION READ ONLY envolvendo a execução
+# 1.5 NUNCA emite SET TRANSACTION READ ONLY (teste negativo)
 # --------------------------------------------------------------------------
 
 
-def test_execute_declares_read_only_before_the_statement():
+def test_fake_de_servidor_falha_se_receber_a_declaracao():
+    """Controle: o próprio fake recusa a declaração, como o T-SQL real."""
+    client = _FakeClient()
+
+    with pytest.raises(RuntimeError) as caught:
+        client.cursor().execute(sqlserver.READ_ONLY_STATEMENT)
+
+    assert sqlserver.READ_ONLY_TSQL_ERROR in str(caught.value)
+
+
+def test_execute_never_declares_read_only_on_the_connection():
+    """1.5: T-SQL não tem a declaração — enviá-la quebraria toda consulta."""
     client = _FakeClient(rows=[("a", 1), ("b", 2)])
     sqlserver.set_driver_module(_FakePymssql(client), optional=None)
 
     result = sqlserver.execute(client, "SELECT * FROM t", 200)
 
-    assert client.executed[0] == sqlserver.READ_ONLY_STATEMENT
-    assert client.executed[-1] == "SELECT * FROM t"
+    assert sqlserver.READ_ONLY_STATEMENT not in client.executed
+    assert client.executed == ["SELECT * FROM t"]  # só a statement da consulta
     assert result["row_count"] == 2
     assert result["truncated"] is False
     assert result["server_version"] == "16.0.1000"
     assert client.rollbacks == 1  # transação revertida ao final
+
+
+def test_execute_sem_declaracao_no_caminho_pyodbc():
+    """O caminho opcional (pyodbc) também não envia a declaração."""
+    client = _FakeClient(rows=[(1,)])
+    sqlserver.set_driver_module(_FakePymssql(_FakeClient()), optional=_FakePyodbc(client))
+    sqlserver._pyodbc_preferred = True
+
+    result = sqlserver.execute(client, "SELECT 1", 200)
+
+    assert result["row_count"] == 1
+    assert sqlserver.READ_ONLY_STATEMENT not in client.executed
+    assert client.executed == ["SELECT 1"]
+    assert client.rollbacks == 1
 
 
 def test_execute_limits_rows_and_flags_truncation():
@@ -249,6 +292,27 @@ def test_execute_limits_rows_and_flags_truncation():
 
     assert result["rows"] == [[0], [1]]
     assert result["row_count"] == 2
+    assert result["truncated"] is True
+
+
+def test_execute_nao_marca_truncado_com_rowcount_negativo_e_exatamente_n_linhas():
+    """P2c: mesmo no SQL Server o ``truncated`` vem do fetch bruto."""
+    client = _FakeClient(rows=[(i,) for i in range(3)], unknown_rowcount=True)
+    sqlserver.set_driver_module(_FakePymssql(client), optional=None)
+
+    result = sqlserver.execute(client, "SELECT * FROM t", 3)
+
+    assert result["row_count"] == 3
+    assert result["truncated"] is False
+
+
+def test_execute_com_rowcount_negativo_e_mais_linhas_marca_truncado():
+    client = _FakeClient(rows=[(i,) for i in range(5)], unknown_rowcount=True)
+    sqlserver.set_driver_module(_FakePymssql(client), optional=None)
+
+    result = sqlserver.execute(client, "SELECT * FROM big", 3)
+
+    assert result["row_count"] == 3
     assert result["truncated"] is True
 
 

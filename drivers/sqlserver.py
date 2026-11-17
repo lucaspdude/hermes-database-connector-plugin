@@ -9,10 +9,12 @@ talking to:
 * optional path: **pyodbc**, detected with ``importlib.util.find_spec`` (task
   1.3, design 12 — confirmed for the MVP). Absent -> pymssql, and nothing
   breaks: the two paths never import each other eagerly.
-* read safety: ``SET TRANSACTION READ ONLY`` is issued on the connection
-  **before** the statement, inside the transaction opened by the driver, and
-  that transaction is rolled back at the end of every execution — including
-  the error ones (task 1.5, design 9).
+* read safety: T-SQL has **no** ``SET TRANSACTION READ ONLY`` (task 1.5), so
+  the driver never sends it — sending it would break every query with a syntax
+  error on a real SQL Server. The guarantee of this engine is the **read-only
+  credential** (documented prerequisite, README/``Política read-only``), and the
+  transaction opened by the driver is rolled back at the end of every
+  execution — including the error ones.
 
 Nothing here talks to a server at import time; real-instance validation is
 still pending (host ``hostgator``: SQL Server external; the pyodbc path also
@@ -40,8 +42,14 @@ PROBE_STATEMENT = "SELECT 1"
 DEFAULT_CONNECT_TIMEOUT_S = 10
 DEFAULT_STATEMENT_TIMEOUT_S = 30
 
-#: Task 1.5: declared on the connection before the statement runs.
+#: Task 1.5: **T-SQL does not have this statement** — it must NEVER be sent to
+#: the server (a real SQL Server answers every query after it with a syntax
+#: error). Kept as a constant so the negative tests can assert its absence.
 READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
+
+#: What a real SQL Server answers to :data:`READ_ONLY_STATEMENT` — used by the
+#: fakes that prove the declaration is never emitted.
+READ_ONLY_TSQL_ERROR = "Incorrect syntax near 'TRANSACTION'"
 
 _MISSING = object()
 _pymssql: Any = _MISSING
@@ -289,27 +297,27 @@ def execute(
     *,
     statement_timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    """Run **one** statement with READ ONLY declared on the connection.
+    """Run **one** statement — **without** any read-only declaration.
 
-    Task 1.5: the transaction is opened by the driver, ``SET TRANSACTION READ
-    ONLY`` is issued before the statement and everything is rolled back at the
-    end — even when the statement raises — so a disguised write (``WITH ...
-    DELETE``) is refused by the bank itself and nothing is left pending.
+    Task 1.5: T-SQL has no ``SET TRANSACTION READ ONLY``, so nothing is issued
+    before the statement (sending it would break every query). Read safety for
+    this engine comes from the read-only credential of the connection; the
+    driver still rolls back at the end — even when the statement raises —
+    leaving nothing pending.
     """
     limit = _positive_int(max_rows, DEFAULT_MAX_ROWS)
     if statement_timeout_s is not None:
         _set_query_timeout(client, statement_timeout_s)
     cursor = client.cursor()
     try:
-        cursor.execute(READ_ONLY_STATEMENT)
         started = time.perf_counter()
         cursor.execute(statement)
-        rows = _fetch_limited(cursor, limit)
+        rows, fetched = _fetch_limited(cursor, limit)
         duration_ms = int(round((time.perf_counter() - started) * 1000))
         return {
             "rows": rows,
             "row_count": len(rows),
-            "truncated": _row_truncated(cursor, limit, len(rows)),
+            "truncated": fetched > limit,
             "duration_ms": duration_ms,
             "server_version": server_version(client),
         }
@@ -354,29 +362,25 @@ def server_version(client: Any) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def _fetch_limited(cursor: Any, limit: int) -> list[list[Any]]:
+def _fetch_limited(cursor: Any, limit: int) -> tuple[list[list[Any]], int]:
+    """``(rows, fetched)`` — ``fetched`` is the **raw** size of the fetch.
+
+    Task P2c: truncation is decided by that raw size (``fetchmany(limit+1)``),
+    not by ``cursor.rowcount``: exactly ``limit`` rows with nothing after them
+    is *not* truncated, whatever the driver reports in ``rowcount`` (-1 or not).
+    """
     try:
-        fetched = cursor.fetchmany(limit + 1)
+        fetched = list(cursor.fetchmany(limit + 1) or ())
     except Exception:  # noqa: BLE001 - fallback for drivers without fetchmany
-        fetched = cursor.fetchall()
+        fetched = list(cursor.fetchall() or ())
     rows: list[list[Any]] = []
-    for row in fetched or ():
+    for row in fetched:
         rows.append(list(row) if not isinstance(row, (str, bytes)) else [row])
-    return rows[:limit]
-
-
-def _row_truncated(cursor: Any, limit: int, delivered: int) -> bool:
-    try:
-        count = int(getattr(cursor, "rowcount", -1) or -1)
-    except Exception:  # noqa: BLE001
-        count = -1
-    if count > limit:
-        return True
-    return delivered >= limit and count != limit
+    return rows[:limit], len(fetched)
 
 
 def _cleanup(client: Any, cursor: Any) -> None:
-    """Rollback + close: the READ ONLY transaction never survives a call."""
+    """Rollback + close: the transaction never survives a call."""
     for closer in (getattr(client, "rollback", None), getattr(cursor, "close", None)):
         if callable(closer):
             try:

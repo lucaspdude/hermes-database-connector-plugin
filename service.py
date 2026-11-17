@@ -508,6 +508,8 @@ QUERY_EVENTS = (EVENT_QUERY_STARTED, EVENT_QUERY_FINISHED, EVENT_QUERY_FAILED)
 #: adapter: tried in order, imported lazily — none of them exists outside a
 #: running Hermes, so importing at module load would break the plugin).
 BROADCAST_SOURCES: tuple[tuple[str, str], ...] = (
+    # caminho real do host (confirmado no checkout do Hermes): primeiro
+    ("hermes_cli.plugin_events", "broadcast_plugin_event"),
     ("hermes.gateway.events", "broadcast_plugin_event"),
     ("hermes.gateway", "broadcast_plugin_event"),
     ("hermes.events", "broadcast_plugin_event"),
@@ -841,7 +843,11 @@ def get_config(key: str, default: Any = None) -> Any:
 
 
 def resolve_broadcast() -> Callable[..., Any] | None:
-    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes."""
+    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes.
+
+    Task P1a: ``hermes_cli.plugin_events`` is the path the host really exposes,
+    so it comes first; the others stay as fallbacks for older builds.
+    """
     for module_name, attribute in BROADCAST_SOURCES:
         try:
             module = __import__(module_name, fromlist=[attribute])
@@ -1166,7 +1172,9 @@ def run_query(
             # política read-only: recusa antes do driver, dentro do ciclo
             guard(statement=statement, args=args, max_rows=max_rows, connection=row)
         client, exc = _run_with_deadline(
-            connect_timeout_s, lambda: driver_module.connect(row, password)
+            connect_timeout_s,
+            lambda: driver_module.connect(row, password),
+            on_late_value=_close_quietly,  # P2b: connect tardio não vaza cliente
         )
         if exc is not None:
             raise exc
@@ -1341,12 +1349,23 @@ def _clean_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
     return text.splitlines()[0][:ERROR_MAX_CHARS]
 
 
-def _run_with_deadline(seconds: float, func: Callable[[], Any]) -> tuple[Any, BaseException | None]:
+def _run_with_deadline(
+    seconds: float,
+    func: Callable[[], Any],
+    *,
+    on_late_value: Callable[[Any], None] | None = None,
+) -> tuple[Any, BaseException | None]:
     """Run ``func`` in a daemon thread, returning ``(value, error | timeout)``.
 
     The budget is enforced even when the driver itself ignores its own timeout
     kwargs. The thread is a daemon: a stuck socket never blocks interpreter
     exit (and never leaks a traceback into the caller).
+
+    ``on_late_value`` releases what the **abandoned** thread still produces
+    after the deadline (P2b): a connect that finishes late would otherwise
+    leave its client open forever, since the caller already gave up on it. A
+    daemon reaper waits for the thread and hands whatever it built to the
+    callback (``_close_quietly`` for a client).
     """
     outcome: dict[str, Any] = {}
 
@@ -1363,7 +1382,34 @@ def _run_with_deadline(seconds: float, func: Callable[[], Any]) -> tuple[Any, Ba
         return outcome["value"], None
     if "error" in outcome:
         return None, outcome["error"]
+    _reap_late(thread, outcome, on_late_value)
     return None, TimeoutError(f"operacao excedeu o timeout de {seconds:g}s")
+
+
+def _reap_late(
+    thread: threading.Thread,
+    outcome: dict[str, Any],
+    on_late_value: Callable[[Any], None] | None,
+) -> None:
+    """Close/register what the thread that blew the deadline produces later.
+
+    Daemon and silent by design: the caller is already reporting a timeout and
+    must not be delayed (or broken) by the cleanup of the client nobody else
+    holds a reference to any more.
+    """
+    if on_late_value is None:
+        return
+
+    def reaper() -> None:
+        try:
+            thread.join()  # the connect may take arbitrarily long: wait for it
+            value = outcome.get("value")
+            if value is not None:
+                on_late_value(value)
+        except Exception:  # noqa: BLE001 - reaping never surfaces
+            pass
+
+    threading.Thread(target=reaper, daemon=True).start()
 
 
 def _close_quietly(obj: Any) -> None:
@@ -1513,12 +1559,14 @@ def test_connection(connection: Mapping[str, Any], registry: DriverRegistry | No
         client, exc = _run_with_deadline(
             connect_timeout_s,
             lambda: _open_redis(driver, row, password, connect_timeout_s, statement_timeout_s),
+            on_late_value=_close_quietly,  # P2b: sem cliente aberto no servidor
         )
     else:
         client, exc = _run_with_deadline(
             connect_timeout_s,
             lambda: _open_sql(driver, engine, row, password, connect_timeout_s,
                               statement_timeout_s),
+            on_late_value=_close_quietly,
         )
     if exc is not None:
         _close_quietly(client)
