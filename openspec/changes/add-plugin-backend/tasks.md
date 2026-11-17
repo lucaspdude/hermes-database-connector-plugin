@@ -37,7 +37,7 @@ Implementa as fases 0 e 1 do plano (`docs/plans/hermes-plugins/database-connecto
 
 ## 5. Validação da change
 
-- [ ] 5.1 Re-rodar `hermes plugins validate <dir> --install-deps` e `hermes plugins doctor <dir> --ci` com o backend completo; confirmar saída limpa
+- [x] 5.1 Re-rodar `hermes plugins validate <dir> --install-deps` e `hermes plugins doctor <dir> --ci` com o backend completo; confirmar saída limpa (hostgator 2026-11-17: validate `ok:true` EXIT=0 com probe real; doctor EXIT=0 — WARN esperado de deps pendentes do install real + breakage pré-existente do plugin custodian no workspace do host, documentado no PR)
 - [ ] 5.2 Bateria manual de ponta a ponta da API no Hermes do host `hostgator` (via ssh): criar conexão → listar → testar contra as instâncias reais (SQL Server e Redis; Postgres local/Docker) → ver `/status` coerente → deletar e conferir cascata no log; registrar desvios no PR
 - [ ] 5.3 Testar o escape de host problemático: `hermes plugins install --no-deps` (plugin instalado e desabilitado, `/health` orientando o comando por engine); verificar que `hermes pm repair` re-sincroniza as deps após instalação manual do driver
 - [ ] 5.4 Abrir PR da feature branch para a `main` (Conventional Commits, CI verde, squash merge) com resumo dos aceites verificados

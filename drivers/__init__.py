@@ -172,6 +172,11 @@ class DriverRegistry:
         self._finder = finder
         self._importer = importer or importlib.import_module
         self._python_executable = python_executable or sys.executable
+        #: Cache of the modules already imported by :meth:`load` (one per
+        #: engine). The driver enters the process **once**, on the first
+        #: execution — never at plugin load — and every later call reuses it
+        #: (design 1 of ``add-agent-db-tools``). Cleared by :meth:`forget`.
+        self._loaded: dict[str, Any] = {}
 
     # -- install sugerido --------------------------------------------------
 
@@ -223,8 +228,23 @@ class DriverRegistry:
 
     # -- carregamento lazy --------------------------------------------------
 
+    def forget(self, engine: str | None = None) -> None:
+        """Drop the cached module of ``engine`` (all engines when omitted).
+
+        Used by the tests and after a driver is installed in a live process, so
+        a new :meth:`load` really re-imports instead of reusing the old answer.
+        """
+        if engine is None:
+            self._loaded.clear()
+            return
+        self._loaded.pop(spec_for(engine).engine, None)
+
     def load(self, engine: str) -> Any:
-        """Return the driver module for ``engine`` (import happens here).
+        """Return the driver module for ``engine`` (import happens **here**).
+
+        Lazy *and* memoised: the first execution imports the module and caches
+        it; every later one reuses the cache, so the cost of a heavy driver is
+        paid once per process and never at plugin load.
 
         Raises :class:`DriverMissingError` — never a raw ``ImportError`` — when
         the engine has no driver, so no stack trace ever reaches the caller.
@@ -241,19 +261,28 @@ class DriverRegistry:
                 )
             return injected
 
+        cached = self._loaded.get(spec.engine)
+        if cached is not None:
+            return cached
+
         if not detect_module(spec.module, self._finder):
+            # nothing is cached for a missing engine: an engine whose driver
+            # shows up later is not poisoned forever, and the absent ones keep
+            # being reported absent without touching the others.
             raise DriverMissingError(
                 engine, spec.module, install,
                 f"driver '{spec.module}' is not installed for engine '{engine}'",
             )
         try:
-            return self._importer(spec.module)
+            module = self._importer(spec.module)
         except Exception as exc:  # noqa: BLE001 - broken install counts as missing
             raise DriverMissingError(
                 engine, spec.module, install,
                 f"driver '{spec.module}' for engine '{engine}' could not be imported "
                 f"({type(exc).__name__})",
             ) from None
+        self._loaded[spec.engine] = module
+        return module
 
 
 def _engine_known(engine: str) -> bool:
