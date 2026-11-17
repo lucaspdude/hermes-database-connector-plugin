@@ -16,6 +16,7 @@ export const SelectContent = component('SelectContent')
 export const SelectItem = component('SelectItem')
 export const SelectTrigger = component('SelectTrigger')
 export const SelectValue = component('SelectValue')
+export const SegmentedControl = component('SegmentedControl')
 export const StatusDot = component('StatusDot')
 export const Switch = component('Switch')
 
