@@ -1,6 +1,6 @@
 """Hermes plugin package for the database-connector plugin.
 
-Everything the plugin offers the agent lives in :mod:`tools` (tasks 3.1–3.4:
+Everything the plugin offers the agent lives in :mod:`db_tools` (tasks 3.1–3.4:
 the three tools, their read policy and the wrapper that never lets an exception
 escape). ``register`` only wires the host into it: store, config provider,
 secret resolver, emitter and finally the three ``ctx.register_tool`` calls.
@@ -67,7 +67,12 @@ def register(ctx):
     """
     register_skills(ctx)
     try:
-        from tools import register_tools  # import lazy: ver docstring do módulo
+        from db_tools import register_tools  # import lazy: ver docstring do módulo.
+    # NB: o módulo NÃO se chama ``tools`` — o próprio Hermes tem um pacote
+    # raiz ``tools/`` (registry de tools built-in) e o capability probe do
+    # ``hermes plugins validate`` injeta a raiz do Hermes no PYTHONPATH à
+    # frente do plugin; ``from tools import ...`` importaria o pacote do
+    # host e o plugin carregaria com zero tools, silenciosamente.
 
         return register_tools(ctx)
     except Exception:  # noqa: BLE001 - registrar não pode derrubar o host

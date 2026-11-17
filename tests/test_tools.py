@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 import service
-import tools
+import db_tools as tools
 from drivers import DriverRegistry
 from drivers import redis as redis_driver
 

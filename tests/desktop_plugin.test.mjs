@@ -256,7 +256,9 @@ test('form: campos por engine e badge de produção', () => {
   }))
   assert.ok(prod.includes('produção — exige confirmação ao salvar'))
   assert.ok(prod.includes('secret_ref'))
-  assert.ok(prod.includes('Driver ODBC'))
+  assert.ok(prod.includes('Driver'))
+  // P1 do review: campos que os drivers não consomem aparecem desabilitados
+  assert.ok(prod.includes('não aplicada nesta versão')) // instância (sqlserver)
   const redis = text(render(ConnectionForm, {
     initial: { id: 'r', engine: 'redis', environment: 'local', host: 'h' },
     connections: [],
@@ -265,6 +267,13 @@ test('form: campos por engine e badge de produção', () => {
   assert.ok(redis.includes('db_index') && redis.includes('TLS'))
   // redis não tem campo database de nível superior
   assert.ok(!redis.includes('obrigatório (db/schema)'))
+  const pg = text(render(ConnectionForm, {
+    initial: { id: 'p', engine: 'postgres', environment: 'homolog', host: 'h', database: 'd' },
+    connections: [],
+    onDone: () => {},
+  }))
+  assert.ok(pg.includes('sslmode'))
+  assert.ok(pg.includes('não aplicado nesta versão')) // schema (postgres)
 })
 
 test('estilo e ciclo de vida: sem hex, sem window timers, sem innerHTML', () => {

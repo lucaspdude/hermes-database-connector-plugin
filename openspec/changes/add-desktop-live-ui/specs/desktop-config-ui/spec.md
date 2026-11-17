@@ -18,11 +18,15 @@ A página de configuração SHALL permitir criar, editar e excluir conexões (co
 - **THEN** recebe confirmação explícita antes do `DELETE /connections/{id}` e a conexão sai da lista
 
 ### Requirement: Campos condicionais por engine
-O formulário SHALL exibir apenas os campos relevantes à engine selecionada — SQL Server: `driver` (caminho pyodbc), `instance?`, `database`, `encrypt`, `trust_server_certificate`; PostgreSQL: `database`, `schema?`, `sslmode`; Redis: `db_index`, `tls` — e SHALL validar campos obrigatórios por engine (`port` e `database` não são universais).
+O formulário SHALL exibir apenas os campos relevantes à engine selecionada **e honrados pelos drivers desta versão** — SQL Server: `driver` (`pymssql` padrão ou `pyodbc`), `database`, `trust_server_certificate`; PostgreSQL: `database`, `sslmode`; Redis: `db_index`, `tls` — SHALL validar campos obrigatórios por engine (`port` e `database` não são universais) e SHALL exibir **desabilitados, com indicação clara**, os campos que os drivers ainda não consomem (`instance`/`encrypt` no SQL Server; `schema` no PostgreSQL) — nunca deixando o usuário acreditar que configurou algo ignorado. Honrar esses campos nos drivers é fase 2.
 
 #### Scenario: Trocar engine muda o form
 - **WHEN** o usuário troca a engine da conexão de `postgres` para `redis`
 - **THEN** os campos de database/sslmode dão lugar a db_index/tls e a validação passa a exigir os campos de Redis
+
+#### Scenario: Campo não honrado aparece desabilitado
+- **WHEN** a engine é `sqlserver` (caminho pymssql) ou `postgres`
+- **THEN** os campos `instance`/`encrypt` (SQL Server) e `schema` (PostgreSQL) aparecem desabilitados com a indicação "não aplicado nesta versão"
 
 ### Requirement: Ambiente explícito com confirmação de produção
 `environment` SHALL ser enum prod/homolog/local com badge visual distinto, sem default implícito; salvar uma conexão em `prod` SHALL exigir confirmação explícita do usuário.

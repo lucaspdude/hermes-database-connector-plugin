@@ -1,6 +1,7 @@
 // database-connector — desktop half (Hermes Desktop Plugin SDK).
 // ESM on disk, loaded uncompiled: no JSX syntax, no build step, no hex colors,
-// no window timers. Children always go through props (jsx/jsxs contract).
+// no window timers. Children always go through props (jsx/jsxs contract) and
+// every element inside an array child carries a key (no React warnings).
 // State: useQuery + shared queryClient; events only invalidate — REST
 // (refetch + 5 s polling) is the source of truth.
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
@@ -87,9 +88,20 @@ function invalidateAll() {
 }
 
 async function readError(exc) {
-  // REST failures arrive as { error, detail }; ctx.rest may reject with either.
+  // REST failures arrive as { error, detail }; ctx.rest may reject with the
+  // body packed into exc.message ("409: {json}") — unwrap the trailing JSON.
   const detail = exc && (exc.detail || exc.error || exc.message)
-  return typeof detail === 'string' && detail ? detail : 'falha desconhecida'
+  if (typeof detail === 'string' && detail) {
+    const json = detail.match(/\{[\s\S]*\}$/)
+    if (json) {
+      try {
+        const body = JSON.parse(json[0])
+        if (body && (body.detail || body.error)) return String(body.detail || body.error)
+      } catch {}
+    }
+    return detail
+  }
+  return 'falha desconhecida'
 }
 
 // ---------------------------------------------------------------- helpers
@@ -153,9 +165,10 @@ function Section({ title, action, children }) {
     style: { marginBottom: 24 },
     children: [
       jsxs('div', {
+        key: 'header',
         style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 },
         children: [
-          jsx('h3', { style: { margin: 0, fontSize: 13 }, children: title }),
+          jsx('h3', { key: 'title', style: { margin: 0, fontSize: 13 }, children: title }),
           action ?? null,
         ],
       }),
@@ -197,7 +210,7 @@ export function StatusChip() {
       cursor: 'pointer',
     },
     children: [
-      jsx(StatusDot, { tone: isError ? 'bad' : active.length > 0 ? 'good' : 'muted' }),
+      jsx(StatusDot, { key: 'dot', tone: isError ? 'bad' : active.length > 0 ? 'good' : 'muted' }),
       label,
     ],
   })
@@ -220,31 +233,33 @@ function ConnectionStatesCard({ connections, queries, activeIds }) {
     style: tableStyle,
     children: [
       jsx(TableHead, {
+        key: 'head',
         columns: ['Conexão', 'Ambiente', 'Engine', 'Estado', 'Último acesso'],
       }),
       jsx('tbody', {
+        key: 'body',
         children: connections.map((c) =>
           jsxs('tr', {
             key: c.id,
             style: rowStyle,
             children: [
-              jsxs('td', { style: cellStyle, children: [
+              jsxs('td', { key: 'label', style: cellStyle, children: [
                 c.label !== c.id
-                  ? jsxs(Fragment, { children: [c.label, ' ', jsx('span', { style: mutedStyle, children: '(' + c.id + ')' })] })
+                  ? jsxs(Fragment, { key: 'main', children: [c.label, ' ', jsx('span', { key: 'id', style: mutedStyle, children: '(' + c.id + ')' })] })
                   : c.id,
-                c.enabled ? null : jsx('span', { style: mutedStyle, children: ' · desabilitada' }),
+                c.enabled ? null : jsx('span', { key: 'off', style: mutedStyle, children: ' · desabilitada' }),
               ] }),
-              jsx('td', { style: cellStyle, children: jsx(EnvBadge, { environment: c.environment }) }),
-              jsx('td', { style: cellStyle, children: ENGINE_LABEL[c.engine] || c.engine }),
-              jsxs('td', { style: cellStyle, children: [
-                jsx(StatusDot, { tone: activeIds.has(c.id) ? 'good' : 'muted' }),
+              jsx('td', { key: 'env', style: cellStyle, children: jsx(EnvBadge, { environment: c.environment }) }),
+              jsx('td', { key: 'engine', style: cellStyle, children: ENGINE_LABEL[c.engine] || c.engine }),
+              jsxs('td', { key: 'state', style: cellStyle, children: [
+                jsx(StatusDot, { key: 'dot', tone: activeIds.has(c.id) ? 'good' : 'muted' }),
                 ' ',
                 activeIds.has(c.id) ? 'consulta ativa' : 'ociosa',
                 c.secret_state && c.secret_state !== 'resolved'
                   ? ' · segredo ' + c.secret_state
                   : null,
               ] }),
-              jsx('td', { style: cellStyle, children: lastUse.has(c.id) ? relativeTime(Date.parse(lastUse.get(c.id))) : '—' }),
+              jsx('td', { key: 'last', style: cellStyle, children: lastUse.has(c.id) ? relativeTime(Date.parse(lastUse.get(c.id))) : '—' }),
             ],
           }),
         ),
@@ -264,8 +279,9 @@ export function ActivityPage() {
   const failed = statusQ.isError || queriesQ.isError
   if (failed) {
     return jsxs('div', { style: { padding: 24 }, children: [
-      jsx('h2', { style: { marginTop: 0 }, children: 'Bancos' }),
+      jsx('h2', { key: 'title', style: { marginTop: 0 }, children: 'Bancos' }),
       jsx(ErrorState, {
+        key: 'error',
         title: 'Backend do plugin indisponível',
         description:
           'O plugin não responde em /api/plugins/database-connector/. ' +
@@ -274,51 +290,58 @@ export function ActivityPage() {
     ] })
   }
   return jsxs('div', { style: { padding: 24 }, children: [
-    jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
-      jsx('h2', { style: { margin: '0 0 16px' }, children: 'Bancos' }),
+    jsxs('div', { key: 'header', style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
+      jsx('h2', { key: 'title', style: { margin: '0 0 16px' }, children: 'Bancos' }),
       jsx(Button, {
+        key: 'drivers',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'drivers')),
         children: 'Drivers',
       }),
       jsx(Button, {
+        key: 'conns',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'connections')),
         children: 'Conexões',
       }),
     ] }),
     jsx(Section, {
+      key: 'connections',
       title: 'Conexões (último acesso)',
       children: jsx(ConnectionStatesCard, { connections, queries, activeIds }),
     }),
     jsx(Section, {
+      key: 'queries',
       title: 'Consultas recentes',
-      action: jsx('span', { style: mutedStyle, children: 'atualiza a cada 5 s' }),
+      action: jsx('span', { key: 'hint', style: mutedStyle, children: 'atualiza a cada 5 s' }),
       children: queries.length
         ? jsx(LogView, {
             children: jsx('table', {
               style: tableStyle,
               children: [
                 jsx(TableHead, {
+                  key: 'head',
                   columns: ['Hora', 'Conexão', 'Ambiente', 'Engine', 'Statement', 'Duração', 'Status'],
                 }),
                 jsx('tbody', {
+                  key: 'body',
                   children: queries.map((q) =>
                     jsxs('tr', {
                       key: q.id,
                       style: rowStyle,
                       children: [
-                        jsx('td', { style: cellStyle, title: q.ts, children: fmtTime(q.ts) }),
-                        jsx('td', { style: cellStyle, children: q.connection_id }),
-                        jsx('td', { style: cellStyle, children: q.environment }),
-                        jsx('td', { style: cellStyle, children: ENGINE_LABEL[q.engine] || q.engine }),
+                        jsx('td', { key: 'time', style: cellStyle, title: q.ts, children: fmtTime(q.ts) }),
+                        jsx('td', { key: 'conn', style: cellStyle, children: q.connection_id }),
+                        jsx('td', { key: 'env', style: cellStyle, children: q.environment }),
+                        jsx('td', { key: 'engine', style: cellStyle, children: ENGINE_LABEL[q.engine] || q.engine }),
                         jsx('td', {
+                          key: 'stmt',
                           style: { ...cellStyle, color: 'var(--ui-text-tertiary)' },
                           title: q.statement || undefined,
                           children: q.statement ? truncate(q.statement, STATEMENT_DISPLAY_CHARS) : '—',
                         }),
-                        jsx('td', { style: cellStyle, children: fmtDuration(q.duration_ms) }),
-                        jsx('td', { style: cellStyle, children: jsx(Badge, { variant: STATUS_VARIANT[q.status] || 'outline', children: q.status }) }),
+                        jsx('td', { key: 'dur', style: cellStyle, children: fmtDuration(q.duration_ms) }),
+                        jsx('td', { key: 'status', style: cellStyle, children: jsx(Badge, { variant: STATUS_VARIANT[q.status] || 'outline', children: q.status }) }),
                       ],
                     }),
                   ),
@@ -340,9 +363,9 @@ function Field({ label, hint, children }) {
   return jsxs('label', {
     style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 10 },
     children: [
-      jsxs('span', { style: { fontSize: 12, color: 'var(--ui-text-secondary)' }, children: [
+      jsxs('span', { key: 'label', style: { fontSize: 12, color: 'var(--ui-text-secondary)' }, children: [
         label,
-        hint ? jsx('span', { style: { ...mutedStyle, marginLeft: 6 }, children: hint }) : null,
+        hint ? jsx('span', { key: 'hint', style: { ...mutedStyle, marginLeft: 6 }, children: hint }) : null,
       ] }),
       children,
     ],
@@ -354,9 +377,9 @@ function EngineSelect({ value, onChange }) {
     value: value || undefined,
     onValueChange: onChange,
     children: [
-      jsx(SelectTrigger, { key: 't', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
+      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
       jsx(SelectContent, {
-        key: 'c',
+        key: 'content',
         children: ENGINES.map((engine) =>
           jsx(SelectItem, { key: engine, value: engine, children: ENGINE_LABEL[engine] })),
       }),
@@ -369,9 +392,9 @@ function EnvironmentSelect({ value, onChange }) {
     value: value || undefined,
     onValueChange: onChange,
     children: [
-      jsx(SelectTrigger, { key: 't', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione (sem padrão)' }) }),
+      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione (sem padrão)' }) }),
       jsx(SelectContent, {
-        key: 'c',
+        key: 'content',
         children: ENVIRONMENTS.map((env) => jsx(SelectItem, { key: env, value: env, children: env })),
       }),
     ],
@@ -379,25 +402,32 @@ function EnvironmentSelect({ value, onChange }) {
 }
 
 // Engine-specific option fields (spec desktop-config-ui: conditional fields).
+// Fields the drivers of this version do NOT consume are rendered disabled with
+// an honest hint — the user must never believe they configured something the
+// backend silently ignores (review P1, 2026-11-17).
 function EngineOptionsFields({ engine, options, setOption }) {
   if (engine === 'sqlserver') {
     return jsxs(Fragment, { children: [
       jsx(Field, {
-        label: 'Driver ODBC',
-        hint: 'opcional (caminho pyodbc)',
+        key: 'driver',
+        label: 'Driver',
+        hint: 'pymssql (padrão) ou pyodbc',
         children: jsx(Input, { style: controlStyle, value: options.driver ?? '', onChange: (e) => setOption('driver', e.target.value) }),
       }),
       jsx(Field, {
+        key: 'instance',
         label: 'Instância',
-        hint: 'opcional',
-        children: jsx(Input, { style: controlStyle, value: options.instance ?? '', onChange: (e) => setOption('instance', e.target.value) }),
+        hint: 'não aplicada nesta versão (pymssql usa host:porta)',
+        children: jsx(Input, { style: controlStyle, value: options.instance ?? '', disabled: true }),
       }),
       jsx(Field, {
+        key: 'encrypt',
         label: 'Encrypt',
-        hint: 'ex.: yes',
-        children: jsx(Input, { style: controlStyle, value: options.encrypt ?? '', onChange: (e) => setOption('encrypt', e.target.value) }),
+        hint: 'fixo do driver: pyodbc usa Encrypt=yes; pymssql via freetds.conf',
+        children: jsx(Input, { style: controlStyle, value: options.encrypt ?? '', disabled: true }),
       }),
       jsx(Field, {
+        key: 'trust',
         label: 'Confiar no certificado do servidor',
         children: jsx(Switch, { checked: !!options.trust_server_certificate, onCheckedChange: (v) => setOption('trust_server_certificate', v) }),
       }),
@@ -406,20 +436,22 @@ function EngineOptionsFields({ engine, options, setOption }) {
   if (engine === 'postgres') {
     return jsxs(Fragment, { children: [
       jsx(Field, {
+        key: 'schema',
         label: 'Schema',
-        hint: 'opcional',
-        children: jsx(Input, { style: controlStyle, value: options.schema ?? '', onChange: (e) => setOption('schema', e.target.value) }),
+        hint: 'não aplicado nesta versão (sem search_path)',
+        children: jsx(Input, { style: controlStyle, value: options.schema ?? '', disabled: true }),
       }),
       jsx(Field, {
+        key: 'sslmode',
         label: 'sslmode',
         hint: 'padrão do driver quando vazio',
         children: jsx(Select, {
           value: options.sslmode || undefined,
           onValueChange: (v) => setOption('sslmode', v),
           children: [
-            jsx(SelectTrigger, { key: 't', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
+            jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
             jsx(SelectContent, {
-              key: 'c',
+              key: 'content',
               children: ['disable', 'prefer', 'require', 'verify-full'].map((mode) =>
                 jsx(SelectItem, { key: mode, value: mode, children: mode })),
             }),
@@ -431,11 +463,13 @@ function EngineOptionsFields({ engine, options, setOption }) {
   if (engine === 'redis') {
     return jsxs(Fragment, { children: [
       jsx(Field, {
+        key: 'db_index',
         label: 'db_index',
         hint: 'padrão 0',
         children: jsx(Input, { style: controlStyle, value: options.db_index ?? '', onChange: (e) => setOption('db_index', e.target.value) }),
       }),
       jsx(Field, {
+        key: 'tls',
         label: 'TLS',
         children: jsx(Switch, { checked: !!options.tls, onCheckedChange: (v) => setOption('tls', v) }),
       }),
@@ -444,7 +478,7 @@ function EngineOptionsFields({ engine, options, setOption }) {
   return null
 }
 
-function requiredMissing(form) {
+function requiredMissing(form, options = {}) {
   const missing = []
   if (!form.id.trim()) missing.push('id')
   if (!form.engine) missing.push('engine')
@@ -452,6 +486,12 @@ function requiredMissing(form) {
   if (!form.host.trim()) missing.push('host')
   if ((form.engine === 'sqlserver' || form.engine === 'postgres') && !form.database.trim()) {
     missing.push('database')
+  }
+  const port = String(form.port).trim()
+  if (port !== '' && !Number.isFinite(Number(port))) missing.push('porta (número)')
+  if (form.engine === 'redis') {
+    const dbIndex = String(options.db_index ?? '').trim()
+    if (dbIndex !== '' && !Number.isFinite(Number(dbIndex))) missing.push('db_index (número)')
   }
   return missing
 }
@@ -477,6 +517,7 @@ function connectionPayload(form, options) {
     database: form.database.trim() || null,
     username: form.username.trim() || null,
     secret_ref: form.secret_ref.trim() || null,
+    // MVP is read-only by construction; editing never flips a stored value.
     read_only: true,
     enabled: form.enabled,
     options: clean,
@@ -513,12 +554,14 @@ export function ConnectionForm({ initial, connections, onDone }) {
       (c.database ?? '') === form.database.trim())
   }, [connections, form])
 
+  // Returns true when saved — ConfirmDialog's onConfirm throws on false so a
+  // failed save keeps the dialog open instead of closing as "done".
   const save = useCallback(async () => {
     setError(null)
-    const missing = requiredMissing(form)
+    const missing = requiredMissing(form, options)
     if (missing.length) {
       setError('Preencha os campos obrigatórios: ' + missing.join(', '))
-      return
+      return false
     }
     const body = connectionPayload(form, options)
     try {
@@ -529,13 +572,15 @@ export function ConnectionForm({ initial, connections, onDone }) {
       }
       invalidateAll()
       onDone()
+      return true
     } catch (exc) {
       setError(await readError(exc))
+      return false
     }
   }, [form, options, editing, onDone])
 
   const submit = () => {
-    if (requiredMissing(form).length) {
+    if (requiredMissing(form, options).length) {
       void save()
       return
     }
@@ -545,79 +590,94 @@ export function ConnectionForm({ initial, connections, onDone }) {
   }
 
   return jsxs('div', { children: [
-    jsx('h3', { style: { marginTop: 0 }, children: editing ? 'Editar conexão' : 'Nova conexão' }),
-    jsxs('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap' }, children: [
-      jsxs('div', { children: [
+    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: editing ? 'Editar conexão' : 'Nova conexão' }),
+    jsxs('div', { key: 'fields', style: { display: 'flex', gap: 16, flexWrap: 'wrap' }, children: [
+      jsxs('div', { key: 'common', children: [
         jsx(Field, {
+          key: 'id',
           label: 'id',
           hint: 'slug único, ex.: prod-sqlserver',
           children: jsx(Input, { style: controlStyle, value: form.id, disabled: editing, onChange: (e) => setField('id')(e.target.value) }),
         }),
         jsx(Field, {
+          key: 'label',
           label: 'Nome de exibição',
           hint: 'opcional',
           children: jsx(Input, { style: controlStyle, value: form.label, onChange: (e) => setField('label')(e.target.value) }),
         }),
-        jsx(Field, { label: 'Engine', children: jsx(EngineSelect, { value: form.engine, onChange: setField('engine') }) }),
-        jsx(Field, { label: 'Ambiente', hint: 'sem padrão', children: jsx(EnvironmentSelect, { value: form.environment, onChange: setField('environment') }) }),
+        jsx(Field, { key: 'engine', label: 'Engine', children: jsx(EngineSelect, { value: form.engine, onChange: setField('engine') }) }),
+        jsx(Field, { key: 'environment', label: 'Ambiente', hint: 'sem padrão', children: jsx(EnvironmentSelect, { value: form.environment, onChange: setField('environment') }) }),
         form.environment === 'prod'
-          ? jsx('div', { style: { marginBottom: 10 }, children: jsx(Badge, { variant: 'destructive', children: 'produção — exige confirmação ao salvar' }) })
+          ? jsx('div', { key: 'prodbadge', style: { marginBottom: 10 }, children: jsx(Badge, { variant: 'destructive', children: 'produção — exige confirmação ao salvar' }) })
           : null,
         jsx(Field, {
+          key: 'host',
           label: 'Host',
           children: jsx(Input, { style: controlStyle, value: form.host, onChange: (e) => setField('host')(e.target.value) }),
         }),
         jsx(Field, {
+          key: 'port',
           label: 'Porta',
-          hint: 'opcional',
+          hint: 'opcional (número)',
           children: jsx(Input, { style: controlStyle, value: form.port, onChange: (e) => setField('port')(e.target.value) }),
         }),
         form.engine === 'redis'
           ? null
           : jsx(Field, {
+              key: 'database',
               label: 'Database',
               hint: 'obrigatório (db/schema)',
               children: jsx(Input, { style: controlStyle, value: form.database, onChange: (e) => setField('database')(e.target.value) }),
             }),
         jsx(Field, {
+          key: 'username',
           label: 'Usuário',
           hint: 'opcional; recomendado somente-leitura',
           children: jsx(Input, { style: controlStyle, value: form.username, onChange: (e) => setField('username')(e.target.value) }),
         }),
         jsx(Field, {
+          key: 'secret',
           label: 'secret_ref',
           hint: 'NOME da env var — nunca o valor',
           children: jsx(Input, { style: controlStyle, value: form.secret_ref, onChange: (e) => setField('secret_ref')(e.target.value) }),
         }),
         jsx(Field, {
+          key: 'enabled',
           label: 'Habilitada',
           children: jsx(Switch, { checked: form.enabled, onCheckedChange: setField('enabled') }),
         }),
       ] }),
       form.engine
-        ? jsxs('div', { children: [
-            jsx('div', { style: { fontSize: 12, color: 'var(--ui-text-secondary)', marginBottom: 10 }, children: 'Opções da engine' }),
+        ? jsxs('div', { key: 'engine', children: [
+            jsx('div', { key: 'opttitle', style: { fontSize: 12, color: 'var(--ui-text-secondary)', marginBottom: 10 }, children: 'Opções da engine' }),
             jsx(EngineOptionsFields, { engine: form.engine, options, setOption }),
           ] })
         : null,
     ] }),
     duplicate
       ? jsx('div', {
+          key: 'duplicate',
           style: { margin: '8px 0', color: 'var(--ui-text-secondary)', fontSize: 12 },
           children: 'Aviso: já existe uma conexão com a mesma engine + ambiente + host + database.',
         })
       : null,
     error
-      ? jsx('div', { style: { margin: '8px 0', color: 'var(--ui-text-secondary)', fontSize: 12 }, children: error })
+      ? jsx('div', { key: 'error', style: { margin: '8px 0', color: 'var(--ui-text-secondary)', fontSize: 12 }, children: error })
       : null,
-    jsxs('div', { style: { display: 'flex', gap: 8 }, children: [
-      jsx(Button, { onClick: submit, children: 'Salvar' }),
-      jsx(Button, { variant: 'ghost', onClick: onDone, children: 'Cancelar' }),
+    jsxs('div', { key: 'actions', style: { display: 'flex', gap: 8 }, children: [
+      jsx(Button, { key: 'save', onClick: submit, children: 'Salvar' }),
+      jsx(Button, { key: 'cancel', variant: 'ghost', onClick: onDone, children: 'Cancelar' }),
     ] }),
     jsx(ConfirmDialog, {
+      key: 'confirm',
       open: confirmProd,
       onClose: () => setConfirmProd(false),
-      onConfirm: save,
+      onConfirm: async () => {
+        if (!(await save())) {
+          // Keep the dialog open; the form behind shows the reason.
+          throw new Error('Falha ao salvar a conexão — veja a mensagem no formulário.')
+        }
+      },
       title: 'Salvar conexão de produção?',
       description: 'A conexão "' + (form.id || form.label) + '" será gravada com environment prod.',
       confirmLabel: 'Salvar em produção',
@@ -629,7 +689,7 @@ function SecretStateBadge({ state }) {
   if (!state) return null
   return jsxs(Fragment, { children: [
     ' ',
-    jsx(Badge, { variant: SECRET_VARIANT[state] || 'outline', children: 'segredo: ' + state }),
+    jsx(Badge, { key: 'badge', variant: SECRET_VARIANT[state] || 'outline', children: 'segredo: ' + state }),
   ] })
 }
 
@@ -678,9 +738,10 @@ export function ConnectionsManager({ connections: connectionsProp }) {
   }
 
   return jsxs('div', { children: [
-    jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
-      jsx('h3', { style: { margin: '0 0 12px' }, children: 'Conexões' }),
+    jsxs('div', { key: 'header', style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
+      jsx('h3', { key: 'title', style: { margin: '0 0 12px' }, children: 'Conexões' }),
       jsx(Button, {
+        key: 'drivers',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'drivers')),
         children: 'Drivers',
@@ -688,6 +749,7 @@ export function ConnectionsManager({ connections: connectionsProp }) {
     ] }),
     connections.length
       ? jsx('table', {
+          key: 'list',
           style: tableStyle,
           children: jsx('tbody', {
             children: connections.map((c) =>
@@ -695,19 +757,20 @@ export function ConnectionsManager({ connections: connectionsProp }) {
                 key: c.id,
                 style: rowStyle,
                 children: [
-                  jsxs('td', { style: cellStyle, children: [
-                    jsx('strong', { children: c.label !== c.id ? c.label : c.id }),
-                    c.label !== c.id ? jsx('span', { style: mutedStyle, children: ' (' + c.id + ')' }) : null,
+                  jsxs('td', { key: 'label', style: cellStyle, children: [
+                    jsx('strong', { key: 'main', children: c.label !== c.id ? c.label : c.id }),
+                    c.label !== c.id ? jsx('span', { key: 'id', style: mutedStyle, children: ' (' + c.id + ')' }) : null,
                   ] }),
-                  jsxs('td', { style: cellStyle, children: [
-                    jsx(Badge, { variant: 'outline', children: ENGINE_LABEL[c.engine] || c.engine }),
+                  jsxs('td', { key: 'badges', style: cellStyle, children: [
+                    jsx(Badge, { key: 'engine', variant: 'outline', children: ENGINE_LABEL[c.engine] || c.engine }),
                     ' ',
-                    jsx(EnvBadge, { environment: c.environment }),
-                    jsx(SecretStateBadge, { state: c.secret_state }),
+                    jsx(EnvBadge, { key: 'env', environment: c.environment }),
+                    jsx(SecretStateBadge, { key: 'secret', state: c.secret_state }),
                     c.secret_state && c.secret_state !== 'resolved'
-                      ? jsxs('div', { style: mutedStyle, children: [
+                      ? jsxs('div', { key: 'hint', style: mutedStyle, children: [
                           'Defina a env var em Settings ▸ Environment. ',
                           jsx('button', {
+                            key: 'open',
                             style: {
                               background: 'none',
                               border: 'none',
@@ -723,16 +786,16 @@ export function ConnectionsManager({ connections: connectionsProp }) {
                         ] })
                       : null,
                   ] }),
-                  jsxs('td', { style: cellStyle, children: [
-                    jsx('span', { style: mutedStyle, children: c.host + (c.port ? ':' + c.port : '') }),
-                    c.database ? jsx('span', { style: mutedStyle, children: ' · ' + c.database }) : null,
-                    jsx('div', { style: mutedStyle, children: tests[c.id] === 'busy' ? 'testando…' : (tests[c.id] ?? '') }),
+                  jsxs('td', { key: 'target', style: cellStyle, children: [
+                    jsx('span', { key: 'host', style: mutedStyle, children: c.host + (c.port ? ':' + c.port : '') }),
+                    c.database ? jsx('span', { key: 'db', style: mutedStyle, children: ' · ' + c.database }) : null,
+                    jsx('div', { key: 'test', style: mutedStyle, children: tests[c.id] === 'busy' ? 'testando…' : (tests[c.id] ?? '') }),
                   ] }),
-                  jsxs('td', { style: cellStyle, children: [
-                    jsxs('div', { style: { display: 'flex', gap: 6 }, children: [
-                      jsx(Button, { variant: 'secondary', onClick: () => void doTest(c), children: 'Testar' }),
-                      jsx(Button, { variant: 'ghost', onClick: () => setEditing(c), children: 'Editar' }),
-                      jsx(Button, { variant: 'ghost', onClick: () => setDeleting(c), children: 'Excluir' }),
+                  jsxs('td', { key: 'actions', style: cellStyle, children: [
+                    jsxs('div', { key: 'row', style: { display: 'flex', gap: 6 }, children: [
+                      jsx(Button, { key: 'test', variant: 'secondary', onClick: () => void doTest(c), children: 'Testar' }),
+                      jsx(Button, { key: 'edit', variant: 'ghost', onClick: () => setEditing(c), children: 'Editar' }),
+                      jsx(Button, { key: 'delete', variant: 'ghost', onClick: () => setDeleting(c), children: 'Excluir' }),
                     ] }),
                   ] }),
                 ],
@@ -741,11 +804,13 @@ export function ConnectionsManager({ connections: connectionsProp }) {
           }),
         })
       : jsx(EmptyState, {
+          key: 'empty',
           title: 'Nenhuma conexão',
           description: 'Crie a primeira conexão para o agente consultar bancos.',
         }),
-    jsx('div', { style: { marginTop: 12 }, children: jsx(Button, { onClick: () => setEditing('new'), children: 'Nova conexão' }) }),
+    jsx('div', { key: 'new', style: { marginTop: 12 }, children: jsx(Button, { onClick: () => setEditing('new'), children: 'Nova conexão' }) }),
     jsx(ConfirmDialog, {
+      key: 'confirm',
       open: !!deleting,
       onClose: () => setDeleting(null),
       onConfirm: doDelete,
@@ -770,8 +835,9 @@ export function DriversPage({ health }) {
     return jsx('div', { style: mutedStyle, children: 'carregando…' })
   }
   return jsxs('div', { children: [
-    jsx('h3', { style: { marginTop: 0 }, children: 'Drivers' }),
+    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: 'Drivers' }),
     jsx('table', {
+      key: 'table',
       style: tableStyle,
       children: jsx('tbody', {
         children: ENGINES.map((engine) => {
@@ -780,27 +846,27 @@ export function DriversPage({ health }) {
             key: engine,
             style: rowStyle,
             children: [
-              jsxs('td', { style: cellStyle, children: [
-                jsx(StatusDot, { tone: info.available ? 'good' : 'bad' }),
+              jsxs('td', { key: 'name', style: cellStyle, children: [
+                jsx(StatusDot, { key: 'dot', tone: info.available ? 'good' : 'bad' }),
                 ' ',
-                jsx('strong', { children: ENGINE_LABEL[engine] || engine }),
+                jsx('strong', { key: 'label', children: ENGINE_LABEL[engine] || engine }),
               ] }),
-              jsxs('td', { style: cellStyle, children: [
+              jsxs('td', { key: 'status', style: cellStyle, children: [
                 info.available
-                  ? 'disponível'
-                  : jsxs(Fragment, { children: [
+                  ? 'disponível' + (info.module ? ' · ' + info.module : '')
+                  : jsxs(Fragment, { key: 'missing', children: [
                       'faltando',
-                      info.module ? jsx('span', { style: mutedStyle, children: ' (módulo ' + info.module + ')' }) : null,
+                      info.module ? jsx('span', { key: 'module', style: mutedStyle, children: ' (módulo ' + info.module + ')' }) : null,
                     ] }),
               ] }),
-              jsxs('td', { style: cellStyle, children: [
+              jsxs('td', { key: 'install', style: cellStyle, children: [
                 info.available || !info.install
                   ? null
-                  : jsxs(Fragment, { children: [
-                      jsx('code', { style: { fontSize: 11 }, children: info.install }),
+                  : jsxs(Fragment, { key: 'cmd', children: [
+                      jsx('code', { key: 'code', style: { fontSize: 11 }, children: info.install }),
                       ' ',
-                      jsx(CopyButton, { text: info.install, title: 'Copiar comando de instalação' }),
-                      jsx('div', { style: mutedStyle, children: 'depois de instalar, reinicie o gateway.' }),
+                      jsx(CopyButton, { key: 'copy', text: info.install, title: 'Copiar comando de instalação' }),
+                      jsx('div', { key: 'note', style: mutedStyle, children: 'depois de instalar, reinicie o gateway.' }),
                     ] }),
               ] }),
             ],
@@ -809,6 +875,7 @@ export function DriversPage({ health }) {
       }),
     }),
     jsx('p', {
+      key: 'note',
       style: mutedStyle,
       children: 'Drivers chegam com o install do plugin (python_dependencies); esta tela orienta só o host que ficou sem algum deles.',
     }),

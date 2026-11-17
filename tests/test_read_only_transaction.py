@@ -28,7 +28,7 @@ import re
 import pytest
 
 import service
-import tools
+import db_tools as tools
 from drivers import postgres
 from drivers import sqlserver
 

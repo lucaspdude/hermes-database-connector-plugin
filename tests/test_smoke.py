@@ -16,7 +16,7 @@ def test_manifest_parses_with_the_three_provided_tools():
 
     assert data["name"] == "database-connector"
     # Task 3.5: the manifest mirrors exactly what register_tools registers.
-    import tools
+    import db_tools as tools
 
     assert sorted(data["provides_tools"]) == sorted(tools.TOOL_NAMES)
 

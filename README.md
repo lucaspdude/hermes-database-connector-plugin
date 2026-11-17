@@ -56,9 +56,12 @@ plugin, sobrevivem a restart):
 - **Campos comuns:** id (slug), nome, engine, **environment** (prod/homolog/
   local — sem default; salvar em **prod** pede confirmação explícita), host,
   porta, database, usuário, `secret_ref`, habilitada.
-- **Por engine:** SQL Server → driver ODBC (opcional), instância, encrypt,
-  trust_server_certificate; PostgreSQL → schema, sslmode; Redis → db_index,
-  TLS.
+- **Por engine (campos honrados nesta versão):** SQL Server → driver
+  (`pymssql` padrão ou `pyodbc`), database, trust_server_certificate;
+  PostgreSQL → database, sslmode; Redis → db_index, TLS. Os campos que os
+  drivers **ainda não consomem** (instância e encrypt no SQL Server; schema no
+  PostgreSQL) aparecem **desabilitados** com a indicação "não aplicado nesta
+  versão" — nada é gravado silenciosamente ignorado (honrá-los é fase 2).
 - **Segredo só por referência:** a conexão guarda o **nome** da env var
   (`secret_ref`); o valor vive no Environment do perfil e é resolvido em
   runtime por perfil ativo. A tela mostra o estado — `resolved`,
@@ -87,8 +90,9 @@ Uma env var por conexão, criada no Environment do perfil Hermes — exemplos:
 - **Chip na status bar** (`● N consultas · M bancos`): N = consultas ativas;
   clique abre a página; backend fora → ponto vermelho "bancos indisponível".
 - **Atualização:** eventos `query.started/finished/failed` e
-  `connection.changed` invalidam; polling de 5 s e `GET /status`
-  (`active` + `last_seq`) reconciliam evento perdido.
+  `connection.changed` invalidam; polling de 5 s e o refetch completo de
+  `GET /queries` + `active` de `GET /status` reconciliam evento perdido
+  (o cursor `last_seq`/`since_id` fica para uma versão com histórico maior).
 
 > **Desvio do indicador na lateral (desfecho B):** a linha da sidebar do
 > Desktop não renderiza conteúdo dinâmico (só `{ path, label, codicon }`), e
@@ -122,8 +126,6 @@ conter nomes de tabela/coluna que identificam o domínio do negócio. O toggle
 `log_statement` (config do plugin, padrão **ligado**) desliga o texto e
 mantém só metadados. **Decisão do usuário sobre manter o padrão ligado:
 pendente** (task 5.5 da change `add-desktop-live-ui`).
-
-## Política read-only
 
 ## Política read-only
 
