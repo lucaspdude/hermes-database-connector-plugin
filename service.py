@@ -1034,6 +1034,7 @@ def run_query(
     config_getter: Callable[[str, Any], Any] | None = None,
     driver: Any | None = None,
     query_id: str | None = None,
+    guard: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Run **one** query end to end: log row + ``query.*`` events + result.
 
@@ -1054,6 +1055,12 @@ def run_query(
     comments, the error comes without DSN/secret/host, and neither ever carries
     the result nor the connection password. ``args`` and the result are never
     logged at all.
+
+    ``guard`` is the read policy of the tools (task 3.3): it runs **here**, after
+    the ``running`` line and ``query.started`` and before the driver is even
+    contacted, so a refused statement leaves the same trace as any other failure
+    (``error`` line + ``query.failed`` with ``code: "read_only"``) instead of
+    being swallowed by the caller.
 
     Returns ``{ok, query_id, rows|value, row_count, truncated, duration_ms}``
     or ``{ok: False, code, error, duration_ms}`` with a stable ``code``.
@@ -1155,6 +1162,9 @@ def run_query(
     emit_query_event(EVENT_QUERY_STARTED, started_payload, emitter)
 
     try:
+        if guard is not None:
+            # política read-only: recusa antes do driver, dentro do ciclo
+            guard(statement=statement, args=args, max_rows=max_rows, connection=row)
         client, exc = _run_with_deadline(
             connect_timeout_s, lambda: driver_module.connect(row, password)
         )

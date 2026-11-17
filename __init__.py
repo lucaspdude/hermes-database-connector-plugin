@@ -1,14 +1,26 @@
 """Hermes plugin package for the database-connector plugin.
 
-Phase 0 skeleton: ``register`` is a deliberate no-op. The service layer, the
-REST routes and the agent tools arrive in the following changes, so nothing is
-imported here yet (an import error at load time would disable the plugin).
+Everything the plugin offers the agent lives in :mod:`tools` (tasks 3.1–3.4:
+the three tools, their read policy and the wrapper that never lets an exception
+escape). ``register`` only wires the host into it: store, config provider,
+secret resolver, emitter and finally the three ``ctx.register_tool`` calls.
+
+Every import is **lazy and inside the function** — a failure at import time (or
+a host without the private helpers) would disable the plugin instead of just
+leaving it without tools.
 """
 
 
 def register(ctx):
     """Entry point called by the Hermes plugin loader.
 
-    Intentionally empty in this change — see ``add-plugin-backend`` task 1.2.
+    Registro real em ctx do Hermes pendente (hostgator): só o aceite no host
+    (``hermes plugins validate`` + uma chamada real do agente) confirma o
+    contrato; aqui o wiring é o mesmo, com as tools já cobertas por testes.
     """
-    return None
+    try:
+        from tools import register_tools  # import lazy: ver docstring do módulo
+
+        return register_tools(ctx)
+    except Exception:  # noqa: BLE001 - registrar não pode derrubar o host
+        return None
