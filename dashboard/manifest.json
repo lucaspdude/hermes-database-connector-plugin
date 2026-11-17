@@ -1,0 +1,4 @@
+{
+  "name": "database-connector",
+  "api": "plugin_api.py"
+}
