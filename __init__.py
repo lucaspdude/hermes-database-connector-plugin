@@ -67,12 +67,15 @@ def register(ctx):
     """
     register_skills(ctx)
     try:
-        from db_tools import register_tools  # import lazy: ver docstring do módulo.
-    # NB: o módulo NÃO se chama ``tools`` — o próprio Hermes tem um pacote
-    # raiz ``tools/`` (registry de tools built-in) e o capability probe do
-    # ``hermes plugins validate`` injeta a raiz do Hermes no PYTHONPATH à
-    # frente do plugin; ``from tools import ...`` importaria o pacote do
-    # host e o plugin carregaria com zero tools, silenciosamente.
+        # The loader imports this file as a PACKAGE (``__path__`` set, plugin
+        # dir NOT on sys.path), so sibling modules are package-relative here;
+        # the absolute fallback covers pytest/tooling importing us top-level.
+        # NB: the module is NOT named ``tools`` — Hermes itself ships a root
+        # ``tools/`` package (built-in tool registry).
+        try:
+            from .db_tools import register_tools
+        except ImportError:
+            from db_tools import register_tools
 
         return register_tools(ctx)
     except Exception:  # noqa: BLE001 - registrar não pode derrubar o host

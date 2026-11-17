@@ -21,6 +21,8 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+import sys
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
@@ -28,6 +30,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import RedirectResponse
+
+# The dashboard API is loaded FLAT (``spec_from_file_location``, no package,
+# no ``__path__``): sibling modules resolve only via the plugin dir on
+# ``sys.path``. No-op under pytest, where the repo root is already there.
+_PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
 
 import drivers
 import service

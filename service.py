@@ -26,7 +26,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping
 
-from drivers import DriverMissingError, DriverRegistry, spec_for
+# Sibling import: package context (gateway) first, top-level (pytest) fallback.
+try:
+    from .drivers import DriverMissingError, DriverRegistry, spec_for
+except ImportError:
+    from drivers import DriverMissingError, DriverRegistry, spec_for
 
 PLUGIN_ID = "database-connector"
 DB_FILENAME = "connector.db"
@@ -941,7 +945,12 @@ def _driver_module(
     """
     if injected is not None:
         return injected
-    module = importlib.import_module(f"drivers.{engine}")
+    try:
+        # package context: ``<plugin_pkg>.drivers.<engine>``; flat context
+        # (dashboard/pytest): plain ``drivers.<engine>``.
+        module = importlib.import_module(f".{engine}", __package__)
+    except (ImportError, TypeError):
+        module = importlib.import_module(f"drivers.{engine}")
     library = registry.load(engine)  # raises DriverMissingError when absent
     setter = getattr(module, "set_driver_module", None)
     if callable(setter):

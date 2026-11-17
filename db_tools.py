@@ -28,8 +28,17 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-import service
-from drivers import DriverRegistry
+# Sibling imports: inside the gateway the plugin loads as a package (relative
+# works, plugin dir is NOT on sys.path); pytest/tooling import us top-level
+# (absolute works). Try relative first, fall back to absolute.
+try:
+    from . import service
+except ImportError:
+    import service
+try:
+    from .drivers import DriverRegistry
+except ImportError:
+    from drivers import DriverRegistry
 
 #: Toolset every tool of this plugin belongs to (namespaced by the host).
 TOOLSET = "database-connector"
