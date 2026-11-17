@@ -42,6 +42,10 @@ QUERY_LOG_CAP = 1000
 STATEMENT_MAX_CHARS = 500
 ERROR_MAX_CHARS = 500
 
+#: ``esquema://usuario:senha@host[:porta][/banco]``: a driver echoes its DSN in
+#: the error, and the DSN carries credentials — never logged, never answered.
+_DSN_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\"'<>)\],;]+")
+
 #: Columns persisted for a connection (whitelist — see task 2.4).
 CONNECTION_COLUMNS = (
     "id",
@@ -150,12 +154,27 @@ def connect(db_path: str | os.PathLike[str] | sqlite3.Connection) -> sqlite3.Con
     return conn
 
 
+#: Serialises every single touch of a **shared** store object: one
+#: ``sqlite3.Connection`` must never be used by two threads at once (its
+#: cursor/transaction state is shared, hence the old ``IndexError``/``locked``).
+#: Wiring resolves the path once (see :func:`canonical_store`) so this lock is
+#: belt-and-braces: it guards the rare call that still reaches the shared
+#: connection and the in-memory fallback below.
+_shared_store_lock = threading.RLock()
+
+
 def database_path(conn: sqlite3.Connection) -> str | None:
-    """Path of the ``main`` database of ``conn``; ``None`` when it is in-memory."""
-    try:
-        rows = conn.execute("PRAGMA database_list").fetchall()
-    except Exception:  # noqa: BLE001 - closed/invalid connection: no path to reuse
-        return None
+    """Path of the ``main`` database of ``conn``; ``None`` when it is in-memory.
+
+    Serialised on purpose: asking a **shared** connection for its path from
+    several threads at once corrupts its cursor state (and every writer paid
+    for it). The wiring never asks twice — see :func:`canonical_store`.
+    """
+    with _shared_store_lock:
+        try:
+            rows = conn.execute("PRAGMA database_list").fetchall()
+        except Exception:  # noqa: BLE001 - closed/invalid connection: no path to reuse
+            return None
     for row in rows:
         name, path = row[1], row[2]
         if name == "main":
@@ -163,9 +182,22 @@ def database_path(conn: sqlite3.Connection) -> str | None:
     return None
 
 
-#: Serialises the fallback below (a store that cannot be re-opened by path,
-#: e.g. ``":memory:"``): one shared object must never be used by two threads.
-_shared_store_lock = threading.RLock()
+def canonical_store(store: Any) -> Store:
+    """Canonical form of the store: **its db path** whenever it can be resolved.
+
+    Called once, at wiring time (:func:`init_store` and
+    ``plugin_api.set_store``): from then on every operation opens its own
+    connection from the path and the shared connection is never touched again.
+    Falls back to the connection itself only for a store that cannot be
+    re-opened by path (``:memory:``), whose use stays serialised by
+    :data:`_shared_store_lock`.
+    """
+    if isinstance(store, (str, os.PathLike)):
+        return str(store)
+    if isinstance(store, sqlite3.Connection):
+        path = database_path(store)
+        return path if path else store
+    raise TypeError("store must be a sqlite3.Connection or a db path")
 
 
 def _private_connection(store: Store) -> sqlite3.Connection | None:
@@ -181,6 +213,9 @@ def _private_connection(store: Store) -> sqlite3.Connection | None:
     """
     if isinstance(store, (str, os.PathLike)):
         return connect(str(store))
+    # Fallback for a store that reached us still as a shared connection: the
+    # read itself is serialised (:func:`database_path`), so parallel callers
+    # never overlap inside the same ``sqlite3`` object.
     path = database_path(store)
     return connect(path) if path else None
 
@@ -245,8 +280,9 @@ def open_store(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def init_store(ctx: Any) -> sqlite3.Connection:
-    """Hermes wiring: open the plugin's SQLite store and migrate it.
+def init_store(ctx: Any) -> Store:
+    """Hermes wiring: open the plugin's SQLite store, migrate it, return the
+    canonical store (the db path) so no operation shares the connection.
 
     The import of ``plugin_db`` is lazy and inside the function: the helper
     only exists inside the Hermes process, so importing it at module level
@@ -259,7 +295,10 @@ def init_store(ctx: Any) -> sqlite3.Connection:
         from hermes_cli.plugins.plugin_storage import plugin_db  # type: ignore[import-not-found]
 
         conn = plugin_db(PLUGIN_ID, DB_FILENAME)
-    return migrate(conn)
+    migrate(conn)
+    # Wiring resolves the path **once**: every operation from here on opens its
+    # own connection from it, instead of asking the shared one.
+    return canonical_store(conn)
 
 
 # --------------------------------------------------------------------------
@@ -774,10 +813,21 @@ def _failure(code: str, error: str, *, started: float, **extra: Any) -> dict[str
     return payload
 
 
+def _scrub_dsn(text: str) -> str:
+    """Remove ``esquema://usuario:senha@host/banco`` from a driver message.
+
+    The whole DSN goes away (spec backend-api: "nunca o DSN completo"): it
+    carries credentials *and* the topology of the environment, so keeping even
+    ``esquema://`` around would still be leaking.
+    """
+    return _DSN_RE.sub("[dsn omitido]", text)
+
+
 def _clean_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
     """One-line, secret-free rendering of an exception (never a stack trace)."""
     message = " ".join(str(exc).split())
     text = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    text = _scrub_dsn(text)
     for secret in secrets:
         if secret:
             text = text.replace(str(secret), "***")

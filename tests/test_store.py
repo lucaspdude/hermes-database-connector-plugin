@@ -248,11 +248,11 @@ def test_query_log_prunes_to_cap_keeping_the_newest(db):
 
 
 def test_concurrent_writes_keep_every_row_and_corrupt_nothing(tmp_path):
-    """8 threads x 50 escritas: 400 linhas, zero erro (nenhuma escrita perdida).
+    """8 escritores x 50 + 4 leitores: 400 linhas, zero erro (spec: REST **e** tool).
 
-    This is the scenario that used to lose data: every call shares the db
-    *path*, so each writer gets its own connection (``write_tx``) instead of
-    fighting over one ``sqlite3.Connection``.
+    The readers matter as much as the writers: ``GET /queries`` / ``GET /status``
+    poll the store while the agent tools write, which is exactly the mix that
+    used to corrupt the shared connection (and lose writes).
     """
     import threading
 
@@ -262,13 +262,14 @@ def test_concurrent_writes_keep_every_row_and_corrupt_nothing(tmp_path):
 
     writers = 8
     per_writer = 50
+    readers = 4
     errors: list[str] = []
 
     def worker(index: int) -> None:
         try:
             for step in range(per_writer):
                 service.append_query_log(
-                    store,  # mesma store injetada pelas rotas: caminho resolvido dela
+                    store,  # mesma store injetada pelas rotas
                     connection_id="prod-sqlserver",
                     engine="sqlserver",
                     environment="prod",
@@ -279,11 +280,21 @@ def test_concurrent_writes_keep_every_row_and_corrupt_nothing(tmp_path):
         except Exception as exc:  # noqa: BLE001 - registrado e assertion abaixo
             errors.append(f"writer {index}: {type(exc).__name__}: {exc}")
 
+    def reader(index: int) -> None:
+        """Polling da UI: o que ``GET /queries`` e ``GET /status`` chamam."""
+        try:
+            for _ in range(25):
+                service.list_query_log(store, limit=100)
+                service.status_snapshot(store, limit=20)
+        except Exception as exc:  # noqa: BLE001 - registrado e assertion abaixo
+            errors.append(f"reader {index}: {type(exc).__name__}: {exc}")
+
     threads = [threading.Thread(target=worker, args=(index,)) for index in range(writers)]
+    threads += [threading.Thread(target=reader, args=(index,)) for index in range(readers)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(30)
+        thread.join(60)
 
     assert errors == [], errors
     assert service.count_query_log(store) == writers * per_writer
@@ -301,6 +312,69 @@ def test_concurrent_writes_keep_every_row_and_corrupt_nothing(tmp_path):
     finally:
         reopened.close()
         store.close()
+
+
+def test_wiring_keeps_the_path_as_the_canonical_store(tmp_path):
+    """Depois do wiring a store e o **caminho**: a conexao compartilhada sai de cena.
+
+    Root cause of the lost writes: ``configure``/``set_store`` used to hand the
+    very same ``sqlite3.Connection`` to every request, and each operation asked
+    *that* object for its path (``PRAGMA database_list``) from every thread.
+    """
+    import os
+
+    from dashboard import plugin_api
+
+    path = str(tmp_path / "connector.db")
+    conn = service.open_store(path)
+    plugin_api.set_store(conn)
+    try:
+        store = plugin_api.get_store()
+        assert isinstance(store, str), store
+        assert store == os.path.realpath(path)
+        assert plugin_api.get_store() == store  # resolvido uma vez, nao por chamada
+
+        # leitura e escrita concorrentes pelo caminho canonico: nada compartilhado
+        import threading
+
+        errors: list[str] = []
+        service.upsert_connection(store, _connection())
+
+        def write(index: int) -> None:
+            try:
+                for step in range(25):
+                    service.append_query_log(
+                        store,
+                        connection_id="prod-sqlserver",
+                        engine="sqlserver",
+                        environment="prod",
+                        statement=f"SELECT {index} FROM t{step}",
+                        source="ui",
+                        ts=_ts(index * 25 + step),
+                    )
+            except Exception as exc:  # noqa: BLE001 - assertion abaixo
+                errors.append(f"writer {index}: {type(exc).__name__}: {exc}")
+
+        def read(index: int) -> None:
+            try:
+                for _ in range(25):
+                    service.list_query_log(store, limit=50)
+                    service.status_snapshot(store)
+            except Exception as exc:  # noqa: BLE001 - assertion abaixo
+                errors.append(f"reader {index}: {type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(4)]
+        threads += [threading.Thread(target=read, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+
+        assert errors == [], errors
+        assert service.count_query_log(store) == 100
+    finally:
+        plugin_api.set_store(None)
+        conn.close()
 
 
 def test_start_and_finish_write_a_single_log_line(db):

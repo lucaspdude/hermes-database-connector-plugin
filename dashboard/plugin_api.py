@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import RedirectResponse
 
 import drivers
 import service
@@ -70,7 +71,7 @@ router = APIRouter()
 # providers — what ``register(ctx)`` plugs in later (wiring do host Hermes)
 # --------------------------------------------------------------------------
 
-_store: sqlite3.Connection | None = None
+_store: Any | None = None
 _store_factory: Callable[[], Any] | None = None
 _driver_registry: drivers.DriverRegistry | None = None
 _secret_resolver: Callable[[str], Any] | None = None
@@ -82,6 +83,11 @@ def set_store(store: Any | None) -> None:
 
     ``register(ctx)`` calls :func:`configure` (or this) with the connection
     returned by ``plugin_db``; tests call it with a ``tmp_path`` database.
+
+    Whatever comes in is canonicalised **here, once** (:func:`service.canonical_store`):
+    the db path becomes the source of truth, so no request ever has to ask the
+    shared connection anything (that shared read used to corrupt concurrent
+    writes — see spec ``connection-store`` -> "Escritas concorrentes").
     """
     global _store, _store_factory
     _store = None
@@ -89,44 +95,49 @@ def set_store(store: Any | None) -> None:
     if store is None:
         return
     if isinstance(store, sqlite3.Connection):
-        _store = store
+        # NB: a ``sqlite3.Connection`` *is* callable in recent Pythons, so this
+        # branch has to come before the factory one.
+        _store = service.canonical_store(store)
     elif callable(store):
         _store_factory = store
-    else:  # pragma: no cover - defensive: anything else is a wiring bug
-        raise TypeError("store must be a sqlite3.Connection or a zero-arg callable")
+    else:
+        _store = service.canonical_store(store)
 
 
-def get_store() -> sqlite3.Connection:
-    """Return the configured store, or fail cleanly when not wired yet.
+def get_store() -> Any:
+    """Return the configured store (its db path), or fail cleanly when not wired.
 
-    The failure is explicit on purpose: replying with an empty payload would
-    look like "no connections" to the UI (the silent-empty trap, R5).
+    Never re-opened here: handing a connection to a route would be handing one
+    shared object to every threadpool thread.
     """
     global _store
-    if _store_factory is not None:
-        _store = service.connect(_store_factory())
+    if _store is None and _store_factory is not None:
+        _store = service.canonical_store(_store_factory())
     if _store is None:
         raise _HttpError(
             503,
             "store_unavailable",
             "store do plugin nao configurado: habilite o plugin e reinicie o gateway",
         )
-    return service.connect(_store)
+    return _store
 
 
-def configure(ctx: Any) -> sqlite3.Connection:
+def configure(ctx: Any) -> Any:
     """Wiring for the Hermes host: open the plugin store and remember it.
+
+    The path is resolved here, once (``service.init_store``): from then on each
+    request opens its own connection and nothing shares the store.
 
     When ``ctx`` exposes ``broadcast_plugin_event`` it becomes the emitter of
     ``connection.changed`` (task 4.6); otherwise the lazy resolution in
     :func:`resolve_broadcast` takes over.
     """
-    conn = service.init_store(ctx)
-    set_store(conn)
+    store = service.init_store(ctx)
+    set_store(store)
     candidate = getattr(ctx, "broadcast_plugin_event", None)
     if callable(candidate):
         set_connection_change_emitter(candidate)
-    return conn
+    return store
 
 
 def set_driver_registry(registry: drivers.DriverRegistry | None) -> None:
@@ -225,8 +236,15 @@ class _HttpError(Exception):
         super().__init__(detail)
 
 
-def _error_response(status_code: int, code: str, detail: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"error": code, "detail": detail})
+def _error_response(
+    status_code: int, code: str, detail: str, *, allow: str | None = None
+) -> JSONResponse:
+    """Always the plugin's shape. A 405 also carries ``Allow``: that header is
+    what a HEAD response can actually deliver (HTTP forbids a body there)."""
+    headers = {"Allow": allow} if allow else None
+    return JSONResponse(
+        status_code=status_code, content={"error": code, "detail": detail}, headers=headers
+    )
 
 
 def _clean(exc: BaseException) -> str:
@@ -529,8 +547,10 @@ def _unexpected_error_handler(_request: Any, exc: Exception) -> JSONResponse:
 #: Path of the catch-all route below (never counted as a "known" route).
 CATCH_ALL_PATH = "/{unknown_path:path}"
 
-#: Methods probed to tell a 404 from a 405 inside the catch-all route.
-_PROBE_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+#: Methods probed to tell a 404 from a 405 inside the catch-all route. ``TRACE``
+#: is here so that even an unusual verb is answered with ``{error, detail}``,
+#: instead of escaping to the framework's own ``{"detail": ...}``.
+_PROBE_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE")
 
 
 def _known_route_segments() -> list[tuple[list[str], list[str]]]:
@@ -550,9 +570,10 @@ def _known_route_segments() -> list[tuple[list[str], list[str]]]:
     return known
 
 
-def _routes_matching(request: Request) -> list[str]:
-    """Methods the router accepts for the requested path (405 vs 404)."""
-    path = request.scope.get("path") or "/"
+def _routes_matching(request: Request, path: str | None = None) -> list[str]:
+    """Methods the router accepts for ``path`` (405 vs 404)."""
+    if path is None:
+        path = request.scope.get("path") or "/"
     requested = path.strip("/").split("/") if path.strip("/") else []
     found: list[str] = []
     for segments, methods in _known_route_segments():
@@ -579,12 +600,21 @@ def _catch_all(request: Request) -> Any:
     methods inside the plugin prefix are answered here, not by the framework.
     """
     path = request.scope.get("path") or "/"
+    # A trailing slash is the *same* resource: answer as Starlette would have
+    # (307 to the canonical path) instead of a misleading 405 for GET.
+    if len(path) > 1 and path.endswith("/"):
+        stripped = path.rstrip("/")
+        if _routes_matching(request, stripped):
+            query = request.scope.get("query_string", b"")
+            target = f"{stripped}?{query.decode()}" if query else stripped
+            return RedirectResponse(url=target, status_code=307)
     allowed = _routes_matching(request)
     if allowed:
         return _error_response(
             405,
             "method_not_allowed",
             f"metodo {request.method} nao permitido em '{path}'; use {', '.join(allowed)}",
+            allow=", ".join(allowed),
         )
     return _error_response(
         404, "not_found", f"rota desconhecida no plugin database-connector: '{path}'"

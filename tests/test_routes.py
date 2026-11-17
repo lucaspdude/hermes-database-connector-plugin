@@ -358,6 +358,43 @@ def test_successful_test_logs_ui_row_and_appears_in_queries(client):
     assert row["duration_ms"] == body["latency_ms"]
 
 
+def test_driver_error_never_carries_the_dsn_to_the_response_or_the_log(client):
+    """Driver que ecoa o DSN: nem a resposta nem o query_log guardam o DSN.
+
+    Spec backend-api/connection-store proibem o DSN completo (ele carrega
+    usuario, senha e topologia), no corpo da resposta **e** no log servido ao
+    Desktop por ``GET /queries``.
+    """
+    test_client, conn = client
+    dsn = "postgres://hermes_ro:s3nh4SuperSecreta@db.prod.local:5432/HubFinanceira"
+    assert (
+        test_client.post(
+            f"{PREFIX}/connections", json=_connection(id="pg-dsn", engine="postgres")
+        ).status_code
+        == 201
+    )
+    plugin_api.set_driver_registry(
+        _registry(postgres=_FakeSqlDriver(raises=RuntimeError(f"could not connect to {dsn}")))
+    )
+
+    response = test_client.post(f"{PREFIX}/connections/pg-dsn/test")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is False
+    assert "postgres://" not in response.text
+    assert "s3nh4SuperSecreta" not in response.text
+    assert "db.prod.local" not in response.text
+    assert "[dsn omitido]" in body["error"]
+
+    row = test_client.get(f"{PREFIX}/queries").json()["queries"][0]
+    assert row["status"] == "error"
+    assert "postgres://" not in (row["error"] or "")
+    assert "s3nh4SuperSecreta" not in (row["error"] or "")
+    assert "db.prod.local" not in (row["error"] or "")
+    assert "[dsn omitido]" in row["error"]
+
+
 def test_failed_test_is_logged_with_error_status(client):
     test_client, conn = client
     assert test_client.post(f"{PREFIX}/connections", json=_connection()).status_code == 201
@@ -848,6 +885,44 @@ def test_every_failure_is_error_and_detail_without_any_app_handler(tmp_path, mon
         assert "RuntimeError" in body["detail"]  # acionavel, sem vazar a causa
         assert "Traceback" not in response.text
         assert SECRET_VALUE not in response.text and "postgres://" not in response.text
+    finally:
+        plugin_api.set_store(None)
+        conn.close()
+
+
+def test_contract_holds_for_unusual_verbs_trailing_slash_and_head(tmp_path):
+    """TRACE, barra final e HEAD tambem respeitam {error, detail}/o recurso.
+
+    Sem handler de app (o host monta o router, nao um app nosso): o formato
+    tem que vir do proprio plugin.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient as _TestClient
+
+    conn = service.open_store(str(tmp_path / "connector.db"))
+    plugin_api.set_store(conn)
+    try:
+        app = FastAPI()  # SEM install_error_handlers
+        app.include_router(plugin_api.router, prefix=PREFIX)
+        test_client = _TestClient(app)
+
+        # verbo fora do esperado: o catch-all responde, nao o framework
+        trace = test_client.request("TRACE", f"{PREFIX}/connections")
+        assert trace.status_code == 405, (trace.status_code, trace.text)
+        assert set(trace.json()) == {"error", "detail"}
+        assert trace.json()["error"] == "method_not_allowed"
+
+        # barra final: o mesmo recurso (307 para o canonical, ou 200 direto)
+        slashed = test_client.get(f"{PREFIX}/connections/", follow_redirects=False)
+        assert slashed.status_code in (200, 307), (slashed.status_code, slashed.text)
+        if slashed.status_code == 307:
+            assert slashed.headers["location"].endswith("/connections")
+        assert test_client.get(f"{PREFIX}/connections/").status_code == 200
+
+        # HEAD: HTTP nao entrega corpo, entao o contrato vem no status + Allow
+        head = test_client.head(f"{PREFIX}/connections")
+        assert head.status_code == 405
+        assert {"GET", "POST"} <= set(head.headers["allow"].split(", "))
     finally:
         plugin_api.set_store(None)
         conn.close()
