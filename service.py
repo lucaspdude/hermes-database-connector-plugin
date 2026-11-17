@@ -13,6 +13,7 @@ the value in memory, at runtime, and reports only its state.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping
@@ -492,6 +493,27 @@ def resolve_secret(
 # 2.5 log de consultas: append do ciclo + poda com cap de 1.000 linhas
 # --------------------------------------------------------------------------
 
+#: Log sources (spec ``activity-log`` -> "Origem e sessão registradas").
+SOURCE_AGENT = "agent"
+SOURCE_UI = "ui"
+
+#: One cycle per query — events are invalidation, the store is the truth
+#: (spec ``activity-log``).
+EVENT_QUERY_STARTED = "query.started"
+EVENT_QUERY_FINISHED = "query.finished"
+EVENT_QUERY_FAILED = "query.failed"
+QUERY_EVENTS = (EVENT_QUERY_STARTED, EVENT_QUERY_FINISHED, EVENT_QUERY_FAILED)
+
+#: Where the host may expose ``broadcast_plugin_event`` (same list as the REST
+#: adapter: tried in order, imported lazily — none of them exists outside a
+#: running Hermes, so importing at module load would break the plugin).
+BROADCAST_SOURCES: tuple[tuple[str, str], ...] = (
+    ("hermes.gateway.events", "broadcast_plugin_event"),
+    ("hermes.gateway", "broadcast_plugin_event"),
+    ("hermes.events", "broadcast_plugin_event"),
+    ("gateway.events", "broadcast_plugin_event"),
+)
+
 _COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _STRING_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
@@ -750,6 +772,480 @@ def connection_view(
     for key in ("password", "secret", "secret_value"):
         view.pop(key, None)
     return view
+
+
+# --------------------------------------------------------------------------
+# 2.6 ciclo único de consulta (design 2): log "running -> ok/error" + eventos.
+#     Eventos reais via broadcast pendentes (hostgator): a emissão usa o
+#     emissor injetado e cai no ``broadcast_plugin_event`` do host.
+# --------------------------------------------------------------------------
+
+#: Defaults of the read policy (spec ``query-policy`` -> "Timeouts e limites").
+DEFAULT_MAX_ROWS = 200
+MAX_ROWS_CAP = 1000
+
+#: Stable error codes answered to the agent (task 2.2).
+CODE_TIMEOUT = "timeout"
+CODE_DB_ERROR = "db_error"
+CODE_DRIVER_MISSING = "driver_missing"
+CODE_SECRET_MISSING = "secret_missing"
+CODE_NOT_FOUND = "not_found"
+CODE_READ_ONLY = "read_only"
+ERROR_CODES = (
+    CODE_TIMEOUT,
+    CODE_DB_ERROR,
+    CODE_DRIVER_MISSING,
+    CODE_SECRET_MISSING,
+    CODE_NOT_FOUND,
+    CODE_READ_ONLY,
+)
+
+#: Toggle declared in ``plugin.yaml`` -> ``config_schema`` (boolean, default
+#: true) and read with the injected ``ctx.get_config("log_statement", true)``.
+CONFIG_LOG_STATEMENT = "log_statement"
+
+_query_event_emitter: Callable[..., Any] | None = None
+_config_getter: Callable[[str, Any], Any] | None = None
+
+
+def set_query_event_emitter(emitter: Callable[..., Any] | None) -> None:
+    """Inject the emitter of ``query.*`` (signature of the host:
+    ``emitter(plugin_id, event, payload)``)."""
+    global _query_event_emitter
+    _query_event_emitter = emitter
+
+
+def get_query_event_emitter() -> Callable[..., Any] | None:
+    return _query_event_emitter
+
+
+def set_config_getter(getter: Callable[[str, Any], Any] | None) -> None:
+    """Inject the config getter (``ctx.get_config`` is plugged by ``register``)."""
+    global _config_getter
+    _config_getter = getter
+
+
+def get_config(key: str, default: Any = None) -> Any:
+    """Read a plugin setting: injected getter first, then ``default``.
+
+    Outside the host (and in the tests) there is no getter, so the documented
+    default wins — ``log_statement`` is therefore *on* by default.
+    """
+    getter = _config_getter
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except Exception:  # noqa: BLE001 - jamais derrubar o ciclo por config
+            return default
+    return default
+
+
+def resolve_broadcast() -> Callable[..., Any] | None:
+    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes."""
+    for module_name, attribute in BROADCAST_SOURCES:
+        try:
+            module = __import__(module_name, fromlist=[attribute])
+        except Exception:  # noqa: BLE001 - module simply not present here
+            continue
+        candidate = getattr(module, attribute, None)
+        if callable(candidate):
+            return candidate
+    return None
+
+
+def emit_query_event(
+    event: str,
+    payload: Mapping[str, Any],
+    emitter: Callable[..., Any] | None = None,
+) -> bool:
+    """Emit one ``query.*`` event. **Never** raises, never decides the result.
+
+    Injected emitter first (tests/listener), then the host's real
+    ``broadcast_plugin_event`` resolved lazily. A dead bus must not lose a
+    query: the store already holds the line and ``GET /status`` reconciles.
+    """
+    try:
+        target = emitter or get_query_event_emitter() or resolve_broadcast()
+        if target is None:
+            return False
+        target(PLUGIN_ID, event, dict(payload))
+        return True
+    except Exception:  # noqa: BLE001 - emissao falha nao derruba o ciclo
+        return False
+
+
+def classify_driver_error(exc: BaseException) -> str:
+    """Map any driver/engine failure to one stable ``code`` (task 2.2).
+
+    Single mapping, used by the cycle *and* by the tools of the next change, so
+    the agent sees the same vocabulary everywhere.
+    """
+    if isinstance(exc, DriverMissingError):
+        return CODE_DRIVER_MISSING
+    declared = getattr(exc, "code", None)
+    if declared in ERROR_CODES:
+        return str(declared)
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
+        # driver-specific timeouts (redis/psycopg/FreeTDS) are subclasses with
+        # "Timeout" in the name; our own deadline raises TimeoutError.
+        return CODE_TIMEOUT
+    return CODE_DB_ERROR
+
+
+def clean_driver_error(
+    exc: BaseException,
+    *,
+    secrets: Iterable[str] = (),
+    hosts: Iterable[str] = (),
+) -> str:
+    """Truncated (500), DSN-less, secret-less rendering of a driver failure.
+
+    Reuses :func:`_clean_error`/:func:`_scrub_dsn`: the whole DSN goes away (it
+    carries credentials *and* topology) and any resolved secret/host that the
+    driver echoed back is masked as well.
+    """
+    text = _clean_error(exc, secrets)
+    for host in hosts:
+        if host:
+            text = text.replace(str(host), "[host omitido]")
+    return text[:ERROR_MAX_CHARS]
+
+
+def map_driver_error(
+    exc: BaseException,
+    *,
+    secrets: Iterable[str] = (),
+    hosts: Iterable[str] = (),
+) -> tuple[str, str]:
+    """``(code, message)`` for a failure: mapping + redaction in one call."""
+    return classify_driver_error(exc), clean_driver_error(exc, secrets=secrets, hosts=hosts)
+
+
+def _driver_module(
+    engine: str,
+    registry: DriverRegistry,
+    injected: Any = None,
+) -> Any:
+    """Uniform driver **adapter** of ``engine`` (``connect``/``execute``/...).
+
+    ``registry.load`` stays the single lazy import point of the *library*
+    (design 1) and its answer is handed to the adapter (so the tests inject a
+    fake library and still exercise the real READ ONLY behaviour). ``injected``
+    short-circuits everything when a whole adapter is provided.
+    """
+    if injected is not None:
+        return injected
+    module = importlib.import_module(f"drivers.{engine}")
+    library = registry.load(engine)  # raises DriverMissingError when absent
+    setter = getattr(module, "set_driver_module", None)
+    if callable(setter):
+        try:
+            setter(library)
+        except TypeError:  # noqa: PERF203 - adapters with extra arguments
+            setter(library, optional=None)
+    return module
+
+
+def _log_statement_enabled(getter: Callable[[str, Any], Any] | None = None) -> bool:
+    """The ``log_statement`` toggle: injected getter, provider, then ``True``."""
+    if callable(getter):
+        try:
+            return bool(getter(CONFIG_LOG_STATEMENT, True))
+        except Exception:  # noqa: BLE001 - config nunca derruba o ciclo
+            return True
+    return bool(get_config(CONFIG_LOG_STATEMENT, True))
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """Positive int or ``default`` (``max_rows`` and friends are limits)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _cycle_failure(
+    code: str,
+    error: str,
+    *,
+    started: float,
+    duration_ms: int | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload = {
+        "ok": False,
+        "code": code,
+        "error": error[:ERROR_MAX_CHARS],
+        "status": "error",
+        "query_id": None,
+        "duration_ms": (
+            duration_ms
+            if duration_ms is not None
+            else int(round((time.perf_counter() - started) * 1000))
+        ),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _execute_on(
+    driver_module: Any,
+    client: Any,
+    spec: Any,
+    *,
+    statement: str | None = None,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    args: Sequence[Any] | None = None,
+    statement_timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """One execution through the uniform interface (SQL: statement; Redis:
+    command + args). Extracted from the cycle so the deadline wraps it."""
+    if spec.probe == "ping":
+        return driver_module.execute(
+            client,
+            statement or "",
+            tuple(args or ()),
+            statement_timeout_s=statement_timeout_s,
+        )
+    if not statement:
+        raise ValueError(f"statement ausente para a engine '{spec.engine}'")
+    return driver_module.execute(
+        client,
+        statement,
+        _positive_int(max_rows, DEFAULT_MAX_ROWS),
+        statement_timeout_s=statement_timeout_s,
+    )
+
+
+def run_query(
+    store: Store,
+    connection_row: Mapping[str, Any] | None,
+    statement: str | None = None,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    source: str = SOURCE_AGENT,
+    session_id: str | None = None,
+    *,
+    args: Sequence[Any] | None = None,
+    conversation_id: str | None = None,
+    registry: DriverRegistry | None = None,
+    resolver: Callable[[str], Any] | None = None,
+    emitter: Callable[..., Any] | None = None,
+    config_getter: Callable[[str, Any], Any] | None = None,
+    driver: Any | None = None,
+    query_id: str | None = None,
+) -> dict[str, Any]:
+    """Run **one** query end to end: log row + ``query.*`` events + result.
+
+    Design decision 2: one single cycle for every engine — SQL carries the
+    statement, Redis carries the command in ``statement`` and its arguments in
+    ``args``. The order is fixed and it is what guarantees there is never an
+    orphan "running" row:
+
+    1. pre-flight (unknown connection, engine, driver, secret) — nothing is
+       logged and no event is emitted, so a failure here leaves no open cycle;
+    2. the ``running`` line (:func:`start_query_log`) + ``query.started``;
+    3. the execution, bounded by the connection's own timeouts;
+    4. the **same** line updated to ``ok``/``error`` (:func:`finish_query_log`)
+       + exactly one of ``query.finished``/``query.failed``.
+
+    Every write to the log is redacted here and only here (task 2.3): the
+    statement is truncated at 500 chars with its literals masked and without
+    comments, the error comes without DSN/secret/host, and neither ever carries
+    the result nor the connection password. ``args`` and the result are never
+    logged at all.
+
+    Returns ``{ok, query_id, rows|value, row_count, truncated, duration_ms}``
+    or ``{ok: False, code, error, duration_ms}`` with a stable ``code``.
+    """
+    started = time.perf_counter()
+    row = dict(connection_row) if isinstance(connection_row, Mapping) else {}
+    connection_id = str(row.get("id")) if row.get("id") else None
+    engine = row.get("engine")
+    environment = row.get("environment")
+    display_database = row.get("database")
+
+    if not connection_id:
+        return _cycle_failure(
+            CODE_NOT_FOUND,
+            "conexao nao informada: o ciclo exige uma conexao com id",
+            started=started,
+            connection_id=connection_id,
+            engine=engine,
+        )
+
+    try:
+        spec = spec_for(engine)
+    except (ValueError, TypeError) as exc:
+        # Unknown engine: reported as a db failure to keep the vocabulary closed.
+        return _cycle_failure(
+            CODE_DB_ERROR, clean_driver_error(exc), started=started,
+            connection_id=connection_id, engine=engine,
+        )
+
+    registry = registry or DriverRegistry()
+
+    try:
+        driver_module = _driver_module(spec.engine, registry, driver)
+    except DriverMissingError as exc:
+        return _cycle_failure(
+            CODE_DRIVER_MISSING,
+            f"driver '{spec.module}' nao instalado para a engine '{engine}'; "
+            f"instale com: {exc.install}",
+            started=started,
+            connection_id=connection_id,
+            engine=engine,
+            module=spec.module,
+            install=exc.install,
+        )
+
+    # Segredo em memoria: resolvido ANTES do started (nunca ha linha orfa de
+    # um ciclo que nao pode nem abrir a conexao).
+    password: str | None = None
+    if row.get("secret_ref"):
+        try:
+            secret = resolve_secret(row, resolver=resolver)
+        except Exception as exc:  # noqa: BLE001 - resolver errors stay clean
+            return _cycle_failure(
+                CODE_SECRET_MISSING,
+                clean_driver_error(exc),
+                started=started,
+                connection_id=connection_id,
+                engine=engine,
+            )
+        if secret["state"] != STATE_RESOLVED:
+            return _cycle_failure(
+                CODE_SECRET_MISSING,
+                str(secret.get("error") or "segredo indisponivel"),
+                started=started,
+                connection_id=connection_id,
+                engine=engine,
+                secret_state=secret["state"],
+            )
+        password = secret["value"]
+
+    connect_timeout_s, statement_timeout_s = connection_timeouts(row)
+
+    query_id = start_query_log(
+        store,
+        connection_id=connection_id,
+        engine=str(engine),
+        environment=str(environment),
+        statement=statement if _log_statement_enabled(config_getter) else None,
+        source=source,
+        query_id=query_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+    )
+    started_at = utc_now_iso()
+
+    base_payload: dict[str, Any] = {
+        "query_id": query_id,
+        "connection_id": connection_id,
+        "label": row.get("label") or connection_id,
+        "engine": engine,
+        "environment": environment,
+        # Nome de exibicao do banco — nunca o DSN.
+        "database": display_database,
+        "session_id": session_id,
+        "started_at": started_at,
+    }
+    started_payload = dict(base_payload)
+    started_payload["status"] = "running"
+    emit_query_event(EVENT_QUERY_STARTED, started_payload, emitter)
+
+    try:
+        client, exc = _run_with_deadline(
+            connect_timeout_s, lambda: driver_module.connect(row, password)
+        )
+        if exc is not None:
+            raise exc
+        try:
+            result, exc = _run_with_deadline(
+                statement_timeout_s,
+                lambda: _execute_on(
+                    driver_module,
+                    client,
+                    spec,
+                    statement=statement,
+                    max_rows=min(_positive_int(max_rows, DEFAULT_MAX_ROWS), MAX_ROWS_CAP),
+                    args=args,
+                    statement_timeout_s=statement_timeout_s,
+                ),
+            )
+            if exc is not None:
+                raise exc
+        finally:
+            _close_quietly(client)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        code, message = map_driver_error(
+            exc, secrets=[password] if password else (), hosts=[row.get("host")]
+        )
+        duration_ms = int(round((time.perf_counter() - started) * 1000))
+        finish_query_log(
+            store, query_id, status="error", duration_ms=duration_ms, error=message
+        )
+        failure_payload = dict(base_payload)
+        failure_payload.update(
+            {
+                "status": "error",
+                "code": code,
+                "error": message,
+                "duration_ms": duration_ms,
+                "finished_at": utc_now_iso(),
+                "rows": None,
+            }
+        )
+        emit_query_event(EVENT_QUERY_FAILED, failure_payload, emitter)
+        return {
+            "ok": False,
+            "code": code,
+            "error": message,
+            "status": "error",
+            "query_id": query_id,
+            "connection_id": connection_id,
+            "engine": engine,
+            "duration_ms": duration_ms,
+        }
+
+    duration_ms = int(result.get("duration_ms") or 0) if isinstance(result, Mapping) else 0
+    rows = result.get("rows") if isinstance(result, Mapping) else None
+    value = result.get("value") if isinstance(result, Mapping) else None
+    row_count = result.get("row_count") if isinstance(result, Mapping) else None
+    if row_count is None and isinstance(rows, list):
+        row_count = len(rows)
+    truncated = bool(result.get("truncated")) if isinstance(result, Mapping) else False
+
+    finish_query_log(
+        store, query_id, status="ok", rows=row_count, duration_ms=duration_ms
+    )
+    finished_payload = dict(base_payload)
+    finished_payload.update(
+        {
+            "status": "ok",
+            "rows": row_count,
+            "duration_ms": duration_ms,
+            "truncated": truncated,
+            "finished_at": utc_now_iso(),
+        }
+    )
+    emit_query_event(EVENT_QUERY_FINISHED, finished_payload, emitter)
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "query_id": query_id,
+        "connection_id": connection_id,
+        "engine": engine,
+        "environment": environment,
+        "rows": rows,
+        "value": value,
+        "row_count": row_count,
+        "truncated": truncated,
+        "duration_ms": duration_ms,
+        "started_at": started_at,
+        "finished_at": finished_payload["finished_at"],
+    }
 
 
 # --------------------------------------------------------------------------
