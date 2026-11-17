@@ -4,13 +4,13 @@ Implementa as fases 0 e 1 do plano (`docs/plans/hermes-plugins/database-connecto
 
 ## 1. Esqueleto do pacote
 
-- [ ] 1.1 Criar `plugin.yaml` **na raiz do repo** (o repo é o próprio pacote instalável — o install lê a árvore do clone) com `manifest_version: 2`, `python_dependencies` (`psycopg[binary]>=3.1,<4`, `redis>=5,<7`, `pymssql>=2.3,<3` — faixa superior obrigatória) e `provides_tools` vazio (preenchido só na change de tools); verificar que `hermes plugins validate` aceita o manifesto
-- [ ] 1.2 Criar `__init__.py` com `register(ctx)` no-op (sem registrar tool ainda) e verificar que o plugin carrega sem erro nos logs
-- [ ] 1.3 Criar `dashboard/manifest.json` (`{ "name": "database-connector", "api": "plugin_api.py" }`) e `dashboard/plugin_api.py` com `router = APIRouter()` e rota ping; verificar com `GET /api/plugins/database-connector/ping` no gateway local
+- [x] 1.1 Criar `plugin.yaml` **na raiz do repo** (o repo é o próprio pacote instalável — o install lê a árvore do clone) com `manifest_version: 2`, `python_dependencies` (`psycopg[binary]>=3.1,<4`, `redis>=5,<7`, `pymssql>=2.3,<3` — faixa superior obrigatória) e `provides_tools` vazio (preenchido só na change de tools); verificar que `hermes plugins validate` aceita o manifesto
+- [x] 1.2 Criar `__init__.py` com `register(ctx)` no-op (sem registrar tool ainda) e verificar que o plugin carrega sem erro nos logs
+- [x] 1.3 Criar `dashboard/manifest.json` (`{ "name": "database-connector", "api": "plugin_api.py" }`) e `dashboard/plugin_api.py` com `router = APIRouter()` e rota ping; verificar com `GET /api/plugins/database-connector/ping` no gateway local
 - [ ] 1.4 Criar `desktop/plugin.js` mínimo (ESM, sem build, default export `{ id: 'database-connector', register(ctx) {} }`) e verificar que aparece em Capabilities → Plugins do Desktop
 - [ ] 1.5 Habilitar no perfil (`hermes plugins enable database-connector`) e ligar o toggle do Desktop; verificar que `ctx.rest` alcança o mount com o plugin em `plugins.enabled`
 - [ ] 1.6 Rodar `hermes plugins validate <dir> --install-deps` e `hermes plugins doctor <dir> --ci` e confirmar saída limpa; aceite da fase 0: plugin carregado nas duas metades
-- [ ] 1.7 Configurar pytest com fakes de `ctx` (store temporário) e o workflow de CI do repo (`.github/workflows/ci.yml`) rodando os testes em cada PR; verificar CI verde num PR de teste
+- [x] 1.7 Configurar pytest com fakes de `ctx` (store temporário) e o workflow de CI do repo (`.github/workflows/ci.yml`) rodando os testes em cada PR; verificar CI verde num PR de teste
 
 ## 2. Store SQLite e CRUD (service.py)
 

@@ -1,0 +1,11 @@
+name: database-connector
+manifest_version: 2
+version: 0.1.0
+description: Database connector for SQL Server, PostgreSQL and Redis — connections, query log and status for the Hermes Desktop
+requires_hermes: ">=0.23"
+python_dependencies:
+  - "psycopg[binary]>=3.1,<4"
+  - "redis>=5,<7"
+  - "pymssql>=2.3,<3"
+provides_tools: []
+provides_hooks: []
