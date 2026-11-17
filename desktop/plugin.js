@@ -293,10 +293,20 @@ const useQueriesList = () =>
   })
 
 const useConnections = () =>
-  useQuery({ queryKey: [...QK, 'connections'], queryFn: () => api('/connections') })
+  useQuery({
+    queryKey: [...QK, 'connections'],
+    queryFn: () => api('/connections'),
+    // Settings reads self-heal: a single failed fetch (gateway briefly down,
+    // plugin freshly mounted) must not stick on an open screen forever.
+    refetchInterval: 15000,
+  })
 
 const useHealth = () =>
-  useQuery({ queryKey: [...QK, 'health'], queryFn: () => api('/health') })
+  useQuery({
+    queryKey: [...QK, 'health'],
+    queryFn: () => api('/health'),
+    refetchInterval: 15000,
+  })
 
 function invalidateAll() {
   queryClient.invalidateQueries({ queryKey: QK })
@@ -1044,9 +1054,10 @@ export function DriversPage({ health }) {
   const engines = health?.engines ?? healthQ.data?.engines
   if (!engines) {
     if (healthQ.isError) {
+      const detail = readError(healthQ.error)
       return jsx(ErrorState, {
         title: t('drivers.healthErrorTitle'),
-        description: t('drivers.healthErrorDesc'),
+        description: t('drivers.healthErrorDesc') + (detail ? '\n' + t('page.errorDetail', truncate(detail, 160)) : ''),
       })
     }
     return jsx('div', { style: mutedStyle, children: t('drivers.loading') })

@@ -229,6 +229,17 @@ test('useQuery com polling de 5 s em status e queries', () => {
   assert.equal(byKey.get('queries').refetchInterval, 5000)
 })
 
+test('health e connections se auto-recuperam (refetch 15 s)', () => {
+  resetQueryCalls()
+  setStubData({ connections: CONNECTIONS, ...HEALTH })
+  registered()
+  render(ConnectionsManager)
+  render(DriversPage)
+  const byKey = new Map(queryCalls.map((call) => [call.queryKey[1], call]))
+  assert.equal(byKey.get('connections').refetchInterval, 15000)
+  assert.equal(byKey.get('health').refetchInterval, 15000)
+})
+
 test('página de atividade: labels (EN), statement truncado, sem segredo', () => {
   resetQueryCalls()
   setStubData({ ...STUB_DATA })
