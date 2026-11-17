@@ -63,3 +63,7 @@ A UI SHALL usar apenas tokens do tema (`var(--ui-*)`) e componentes do kit (ex.:
 #### Scenario: Alternância de tema
 - **WHEN** o usuário alterna entre tema claro e escuro
 - **THEN** a página e o chip mantêm contraste sem cores hardcoded
+
+#### Scenario: Strings localizadas no padrão do app
+- **WHEN** o usuário alterna o idioma do app (`display.language`)
+- **THEN** todos os textos da UI vêm dos catálogos do plugin via `ctx.i18n.register` + `usePluginI18n` (en fallback + pt-BR), sem string hardcoded — superfícies estáticas (sidebar/paleta) se reconstruem em `onLocaleChange`

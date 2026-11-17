@@ -1,6 +1,6 @@
 // Local verification of desktop/plugin.js without the Hermes Desktop app
 // (tasks add-desktop-live-ui 2.x-5.1): import, register() wiring, listeners,
-// render labels, statement truncation, style/lifecycle greps.
+// render labels (EN bundle), statement truncation, style/lifecycle greps.
 // Run: node --import ./tests/desktop/register-stubs.mjs --test tests/desktop_plugin.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,7 +13,15 @@ import plugin, {
   ConnectionForm,
   DriversPage,
 } from '../desktop/plugin.js'
-import { host, queryClient, queryCalls, resetQueryCalls, setStubData } from './desktop/stubs/plugin-sdk.mjs'
+import {
+  host,
+  queryClient,
+  queryCalls,
+  resetQueryCalls,
+  setStubData,
+  registerStubLocales,
+  usePluginI18n,
+} from './desktop/stubs/plugin-sdk.mjs'
 
 const SOURCE = readFileSync(fileURLToPath(new URL('../desktop/plugin.js', import.meta.url)), 'utf8')
 
@@ -128,6 +136,9 @@ function fakeCtx() {
     },
     register(contribution) {
       ctx.registered.push(contribution)
+      return () => {
+        ctx.disposers += 1
+      }
     },
     registerMany(contributions) {
       ctx.registered.push(...contributions)
@@ -142,8 +153,22 @@ function fakeCtx() {
       }
     },
     onDispose() {},
+    i18n: {
+      register(bundles) {
+        registerStubLocales('database-connector', bundles)
+      },
+      t: usePluginI18n('database-connector'),
+      onLocaleChange() {
+        return () => {}
+      },
+    },
   }
   return ctx
+}
+
+// register() wires the locale bundles the translated renders depend on.
+function registered() {
+  plugin.register(fakeCtx())
 }
 
 function render(component, props = {}) {
@@ -164,14 +189,14 @@ test('register: página, sidebar, paleta, chip, settings e os 4 listeners', () =
   assert.equal(typeof areas.routes.render, 'function')
   assert.deepEqual(
     { path: areas['sidebar.nav'].data.path, label: areas['sidebar.nav'].data.label },
-    { path: '/databases', label: 'Bancos' },
+    { path: '/databases', label: 'Databases' },
   )
   assert.equal(areas['statusbar.right'].id, 'chip')
-  assert.equal(areas.palette.data.label, 'Abrir Bancos')
+  assert.equal(areas.palette.data.label, 'Open Databases')
   // paleta navega para a página
   areas.palette.data.run()
   assert.ok(host.navigations.includes('/databases'))
-  // chip navega para a página
+  // os 4 eventos invalidadores
   assert.deepEqual(ctx.events.map((e) => e.type).sort(), [
     'plugin.database-connector.connection.changed',
     'plugin.database-connector.query.failed',
@@ -196,6 +221,7 @@ test('eventos invalidam a query key do plugin', () => {
 test('useQuery com polling de 5 s em status e queries', () => {
   resetQueryCalls()
   setStubData({ ...STUB_DATA })
+  registered()
   render(ActivityPage)
   render(StatusChip)
   const byKey = new Map(queryCalls.map((call) => [call.queryKey[1], call]))
@@ -203,11 +229,12 @@ test('useQuery com polling de 5 s em status e queries', () => {
   assert.equal(byKey.get('queries').refetchInterval, 5000)
 })
 
-test('página de atividade: labels, statement truncado, sem segredo', () => {
+test('página de atividade: labels (EN), statement truncado, sem segredo', () => {
   resetQueryCalls()
   setStubData({ ...STUB_DATA })
+  registered()
   const raw = text(render(ActivityPage))
-  for (const label of ['Bancos', 'Consultas recentes', 'Hora', 'Conexão', 'Engine', 'Duração', 'Status', 'Último acesso', 'consulta ativa']) {
+  for (const label of ['Databases', 'Recent queries', 'Time', 'Connection', 'Engine', 'Duration', 'Status', 'Last access', 'active query']) {
     assert.ok(raw.includes(label), 'falta label: ' + label)
   }
   // statement de 300 chars nunca aparece cru
@@ -215,23 +242,25 @@ test('página de atividade: labels, statement truncado, sem segredo', () => {
   // nenhum valor de segredo em lugar nenhum
   assert.ok(!raw.includes('DB_PROD_SQLSERVER_PASSWORD'))
   // estado por conexão (desfecho B: card último acesso) presente
-  assert.ok(raw.includes('ociosa') || raw.includes('consulta ativa'))
+  assert.ok(raw.includes('idle') || raw.includes('active query'))
 })
 
 test('chip: consultas ativas e bancos', () => {
   resetQueryCalls()
   setStubData({ ...STUB_DATA })
-  assert.match(text(render(StatusChip)), /1 consulta · 1 banco/)
+  registered()
+  assert.match(text(render(StatusChip)), /1 query · 1 database/)
   // erro de backend → indicador de falha, não número congelado
   setStubData({}, { isError: true })
-  assert.match(text(render(StatusChip)), /indisponível/)
+  assert.match(text(render(StatusChip)), /unavailable/)
 })
 
 test('settings: lista de conexões, secret_state e aviso de env var', () => {
   resetQueryCalls()
   setStubData({ connections: CONNECTIONS })
+  registered()
   const raw = text(render(ConnectionsManager))
-  for (const label of ['Conexões', 'Nova conexão', 'Testar', 'Editar', 'Excluir', 'segredo: missing', 'Settings ▸ Environment']) {
+  for (const label of ['Connections', 'New connection', 'Test', 'Edit', 'Delete', 'secret: missing', 'Settings ▸ Environment']) {
     assert.ok(raw.includes(label), 'falta label: ' + label)
   }
 })
@@ -239,26 +268,28 @@ test('settings: lista de conexões, secret_state e aviso de env var', () => {
 test('settings: drivers com comando de install e aviso de gateway', () => {
   resetQueryCalls()
   setStubData({ ...HEALTH })
+  registered()
   const raw = text(render(DriversPage))
-  assert.ok(raw.includes('reinicie o gateway'))
+  assert.ok(raw.includes('restart the gateway'))
   assert.ok(raw.includes('uv pip install redis>=5,<7'))
-  assert.ok(raw.includes('disponível'))
-  assert.ok(raw.includes('faltando'))
+  assert.ok(raw.includes('available'))
+  assert.ok(raw.includes('missing'))
 })
 
-test('form: campos por engine e badge de produção', () => {
+test('form: campos por engine, badge de produção e campos não honrados desabilitados', () => {
   resetQueryCalls()
   setStubData({})
+  registered()
   const prod = text(render(ConnectionForm, {
     initial: { id: 'x', engine: 'sqlserver', environment: 'prod', host: 'h', database: 'd' },
     connections: [],
     onDone: () => {},
   }))
-  assert.ok(prod.includes('produção — exige confirmação ao salvar'))
+  assert.ok(prod.includes('production — saving asks for confirmation'))
   assert.ok(prod.includes('secret_ref'))
   assert.ok(prod.includes('Driver'))
   // P1 do review: campos que os drivers não consomem aparecem desabilitados
-  assert.ok(prod.includes('não aplicada nesta versão')) // instância (sqlserver)
+  assert.ok(prod.includes('not applied in this version'))
   const redis = text(render(ConnectionForm, {
     initial: { id: 'r', engine: 'redis', environment: 'local', host: 'h' },
     connections: [],
@@ -266,14 +297,14 @@ test('form: campos por engine e badge de produção', () => {
   }))
   assert.ok(redis.includes('db_index') && redis.includes('TLS'))
   // redis não tem campo database de nível superior
-  assert.ok(!redis.includes('obrigatório (db/schema)'))
+  assert.ok(!redis.includes('required (db/schema)'))
   const pg = text(render(ConnectionForm, {
     initial: { id: 'p', engine: 'postgres', environment: 'homolog', host: 'h', database: 'd' },
     connections: [],
     onDone: () => {},
   }))
   assert.ok(pg.includes('sslmode'))
-  assert.ok(pg.includes('não aplicado nesta versão')) // schema (postgres)
+  assert.ok(pg.includes('not applied in this version')) // schema (postgres)
 })
 
 test('estilo e ciclo de vida: sem hex, sem window timers, sem innerHTML', () => {
