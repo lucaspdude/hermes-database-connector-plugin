@@ -14,11 +14,11 @@ Implementa as fases 0 e 1 do plano (`docs/plans/hermes-plugins/database-connecto
 
 ## 2. Store SQLite e CRUD (service.py)
 
-- [ ] 2.1 Criar `service.py` no root do pacote com conexão via `plugin_db("database-connector", "connector.db")` (WAL, `foreign_keys=True`, `busy_timeout`) e migração versionada criando `connections` e `query_log` (+ índices `ix_query_log_ts`, `ix_query_log_conn`) conforme specs/connection-store; verificar com teste de unidade que a migração é idempotente e cria todos os campos/índices
-- [ ] 2.2 Implementar CRUD de conexões: upsert por `id`, validação de `engine` e `environment` (enums), defaults (`read_only: 1`, `enabled: 1`, `options_json: '{}'`), `created_at`/`updated_at` ISO-8601 UTC e delete em cascata do log; verificar com teste de unidade (criar → upsert → delete cascata) que linhas do log somem com a conexão
-- [ ] 2.3 Implementar `resolve_secret(connection)` via `agent.secret_scope.get_secret` retornando estado `resolved`/`missing`/`unscoped` (capitura de `UnscopedSecretError` em multiplexação sem escopo); verificar com teste de unidade cobrindo as três condições
-- [ ] 2.4 Garantir que nenhum caminho de escrita persiste valor de segredo (só `secret_ref`); verificar com teste de unidade que grep no arquivo do banco não encontra a senha de teste
-- [ ] 2.5 Implementar a poda do `query_log` com cap de 1.000 linhas na escrita (mesma transação); verificar com teste de unidade que inserir além do cap apaga as linhas mais antigas e o total nunca excede 1.000
+- [x] 2.1 Criar `service.py` no root do pacote com conexão via `plugin_db("database-connector", "connector.db")` (WAL, `foreign_keys=True`, `busy_timeout`) e migração versionada criando `connections` e `query_log` (+ índices `ix_query_log_ts`, `ix_query_log_conn`) conforme specs/connection-store; verificar com teste de unidade que a migração é idempotente e cria todos os campos/índices
+- [x] 2.2 Implementar CRUD de conexões: upsert por `id`, validação de `engine` e `environment` (enums), defaults (`read_only: 1`, `enabled: 1`, `options_json: '{}'`), `created_at`/`updated_at` ISO-8601 UTC e delete em cascata do log; verificar com teste de unidade (criar → upsert → delete cascata) que linhas do log somem com a conexão
+- [x] 2.3 Implementar `resolve_secret(connection)` via `agent.secret_scope.get_secret` retornando estado `resolved`/`missing`/`unscoped` (capitura de `UnscopedSecretError` em multiplexação sem escopo); verificar com teste de unidade cobrindo as três condições
+- [x] 2.4 Garantir que nenhum caminho de escrita persiste valor de segredo (só `secret_ref`); verificar com teste de unidade que grep no arquivo do banco não encontra a senha de teste
+- [x] 2.5 Implementar a poda do `query_log` com cap de 1.000 linhas na escrita (mesma transação); verificar com teste de unidade que inserir além do cap apaga as linhas mais antigas e o total nunca excede 1.000
 
 ## 3. Teste de conexão e health de drivers
 
