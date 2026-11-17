@@ -16,9 +16,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+
+from drivers import DriverMissingError, DriverRegistry, spec_for
 
 PLUGIN_ID = "database-connector"
 DB_FILENAME = "connector.db"
@@ -523,3 +527,300 @@ def list_query_log(
 
 def count_query_log(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
+
+
+# --------------------------------------------------------------------------
+# 3.1 teste de conexão — probe real; validação contra instância real pendente
+#     (hostgator: SQL Server e Redis externos, Postgres local/Docker)
+# --------------------------------------------------------------------------
+
+#: Only used when the connection's ``options`` do not override them.
+DEFAULT_CONNECT_TIMEOUT_S = 10
+DEFAULT_STATEMENT_TIMEOUT_S = 30
+
+#: Probe mínimo por engine (spec backend-api -> "Teste de conexao").
+PROBE_STATEMENTS = {"sqlserver": "SELECT 1", "postgres": "SELECT 1"}
+
+
+def connection_options(connection_row: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode the connection's options (``options_json`` *or* ``options``).
+
+    Accepted as a JSON string or as an object, mirroring what
+    :func:`upsert_connection` normalises into the row.
+    """
+    if not isinstance(connection_row, Mapping):
+        return {}
+    raw = connection_row.get("options_json")
+    if raw is None:
+        raw = connection_row.get("options")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _timeout_value(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def connection_timeouts(connection_row: Mapping[str, Any]) -> tuple[float, float]:
+    """``(connect_timeout_s, statement_timeout_s)`` for a connection row."""
+    options = connection_options(connection_row)
+    return (
+        _timeout_value(options.get("connect_timeout_s"), DEFAULT_CONNECT_TIMEOUT_S),
+        _timeout_value(options.get("statement_timeout_s"), DEFAULT_STATEMENT_TIMEOUT_S),
+    )
+
+
+def _failure(code: str, error: str, *, started: float, **extra: Any) -> dict[str, Any]:
+    """Uniform failure payload: clear message, no traceback, no secret/DSN."""
+    payload = {
+        "ok": False,
+        "code": code,
+        "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+        "error": error,
+    }
+    payload.update(extra)
+    return payload
+
+
+def _clean_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
+    """One-line, secret-free rendering of an exception (never a stack trace)."""
+    message = " ".join(str(exc).split())
+    text = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***")
+    # A driver message may echo the DSN; keep only the first line, truncated.
+    return text.splitlines()[0][:ERROR_MAX_CHARS]
+
+
+def _run_with_deadline(seconds: float, func: Callable[[], Any]) -> tuple[Any, BaseException | None]:
+    """Run ``func`` in a daemon thread, returning ``(value, error | timeout)``.
+
+    The budget is enforced even when the driver itself ignores its own timeout
+    kwargs. The thread is a daemon: a stuck socket never blocks interpreter
+    exit (and never leaks a traceback into the caller).
+    """
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if "value" in outcome:
+        return outcome["value"], None
+    if "error" in outcome:
+        return None, outcome["error"]
+    return None, TimeoutError(f"operacao excedeu o timeout de {seconds:g}s")
+
+
+def _close_quietly(obj: Any) -> None:
+    closer = getattr(obj, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:  # noqa: BLE001 - closing must never mask the result
+            pass
+
+
+def _server_version(client: Any) -> str | None:
+    """Best-effort server version, read from the driver without extra probes."""
+    for holder in (getattr(client, "info", None), client):
+        value = getattr(holder, "server_version", None) if holder is not None else None
+        if isinstance(value, (str, int, float)) and value:
+            return str(value)
+    return None
+
+
+def _open_sql(driver: Any, engine: str, row: Mapping[str, Any], password: str | None,
+              connect_timeout_s: float, statement_timeout_s: float) -> Any:
+    host = str(row.get("host") or "")
+    port = row.get("port")
+    database = row.get("database")
+    username = row.get("username")
+
+    if engine == "postgres":  # psycopg
+        kwargs: dict[str, Any] = {"host": host, "connect_timeout": max(int(connect_timeout_s), 1)}
+        if port:
+            kwargs["port"] = int(port)
+        if database:
+            kwargs["dbname"] = database
+        if username:
+            kwargs["user"] = username
+        if password is not None:
+            kwargs["password"] = password
+        return driver.connect(**kwargs)
+
+    # sqlserver -> pymssql (FreeTDS: "host:port")
+    kwargs = {
+        "server": f"{host}:{port}" if port else host,
+        "login_timeout": max(int(connect_timeout_s), 1),
+        "timeout": max(int(statement_timeout_s), 1),
+    }
+    if username:
+        kwargs["user"] = username
+    if password is not None:
+        kwargs["password"] = password
+    if database:
+        kwargs["database"] = database
+    return driver.connect(**kwargs)
+
+
+def _open_redis(driver: Any, row: Mapping[str, Any], password: str | None,
+                connect_timeout_s: float, statement_timeout_s: float) -> Any:
+    kwargs: dict[str, Any] = {
+        "host": str(row.get("host") or ""),
+        "port": int(row.get("port") or 6379),
+        "socket_connect_timeout": connect_timeout_s,
+        "socket_timeout": statement_timeout_s,
+    }
+    if row.get("username"):
+        kwargs["username"] = row["username"]
+    if password is not None:
+        kwargs["password"] = password
+    if row.get("database"):
+        try:
+            kwargs["db"] = int(row["database"])
+        except (TypeError, ValueError):
+            pass
+    factory = getattr(driver, "Redis", None)
+    return (factory if callable(factory) else driver)(**kwargs)
+
+
+def test_connection(connection: Mapping[str, Any], registry: DriverRegistry | None = None,
+                    resolver: Callable[[str], Any] | None = None) -> dict[str, Any]:
+    """Open a real connection for the engine, run the minimal probe, report.
+
+    Returns ``{"ok": True, "latency_ms": int, "server_version": str?}`` or
+    ``{"ok": False, "code": ..., "error": "..."}`` — always a clean message:
+    no stack trace, no password and no full DSN leak into the payload.
+
+    ``registry`` accepts an injected driver (fakes/tests: real ``drivers/``
+    modules land in the next change); ``resolver`` resolves the secret.
+    Timeouts come from the connection's ``options``
+    (``connect_timeout_s``/``statement_timeout_s``, defaults 10s/30s).
+    """
+    started = time.perf_counter()
+    row = dict(connection) if isinstance(connection, Mapping) else {}
+    engine = row.get("engine")
+
+    try:
+        spec = spec_for(engine)
+    except ValueError as exc:
+        return _failure("invalid_engine", str(exc), started=started)
+
+    registry = registry or DriverRegistry()
+
+    try:
+        driver = registry.load(engine)
+    except DriverMissingError as exc:
+        return _failure(
+            "driver_missing",
+            f"driver '{spec.module}' nao instalado para a engine '{engine}'; "
+            f"instale com: {exc.install}",
+            started=started,
+            engine=engine,
+            module=spec.module,
+            install=exc.install,
+        )
+
+    # Segredo resolvido em memoria — nunca persistido, nunca no payload.
+    password: str | None = None
+    if row.get("secret_ref"):
+        try:
+            secret = resolve_secret(row, resolver=resolver)
+        except Exception as exc:  # noqa: BLE001 - resolver errors stay clean too
+            return _failure("secret_error", _clean_error(exc),
+                            started=started, engine=engine)
+        if secret["state"] != STATE_RESOLVED:
+            return _failure(
+                f"secret_{secret['state']}",
+                str(secret.get("error") or "segredo indisponivel"),
+                started=started,
+                engine=engine,
+                secret_state=secret["state"],
+            )
+        password = secret["value"]
+        secrets_to_scrub = [password]
+    else:
+        secrets_to_scrub = []
+
+    connect_timeout_s, statement_timeout_s = connection_timeouts(row)
+
+    # Fase 1: abrir (budget = connect_timeout_s)
+    if spec.probe == "ping":
+        client, exc = _run_with_deadline(
+            connect_timeout_s,
+            lambda: _open_redis(driver, row, password, connect_timeout_s, statement_timeout_s),
+        )
+    else:
+        client, exc = _run_with_deadline(
+            connect_timeout_s,
+            lambda: _open_sql(driver, engine, row, password, connect_timeout_s,
+                              statement_timeout_s),
+        )
+    if exc is not None:
+        _close_quietly(client)
+        if isinstance(exc, TimeoutError):
+            return _failure(
+                "connect_timeout",
+                f"timeout de {connect_timeout_s:g}s excedido ao conectar em "
+                f"{row.get('host')} (engine '{engine}')",
+                started=started,
+                engine=engine,
+            )
+        return _failure("connect_error", _clean_error(exc, secrets_to_scrub),
+                        started=started, engine=engine)
+
+    # Fase 2: sonda mínima (budget = statement_timeout_s)
+    def probe() -> None:
+        try:
+            if spec.probe == "ping":
+                client.ping()
+                return
+            cursor = client.cursor()
+            try:
+                cursor.execute(PROBE_STATEMENTS[engine])
+                try:
+                    cursor.fetchone()
+                except Exception:  # noqa: BLE001 - some drivers have no row
+                    pass
+            finally:
+                _close_quietly(cursor)
+        finally:
+            _close_quietly(client)
+
+    _, exc = _run_with_deadline(statement_timeout_s, probe)
+    if exc is not None:
+        _close_quietly(client)
+        if isinstance(exc, TimeoutError):
+            return _failure(
+                "statement_timeout",
+                f"timeout de {statement_timeout_s:g}s excedido na sonda da engine "
+                f"'{engine}'",
+                started=started,
+                engine=engine,
+            )
+        return _failure("probe_error", _clean_error(exc, secrets_to_scrub),
+                        started=started, engine=engine)
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+    }
+    version = _server_version(client)
+    if version:
+        payload["server_version"] = version
+    return payload

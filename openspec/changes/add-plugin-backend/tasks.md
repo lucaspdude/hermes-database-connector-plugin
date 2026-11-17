@@ -22,8 +22,8 @@ Implementa as fases 0 e 1 do plano (`docs/plans/hermes-plugins/database-connecto
 
 ## 3. Teste de conexão e health de drivers
 
-- [ ] 3.1 Implementar `test_connection()` por engine: abrir com os timeouts da conexão, probe mínimo (`SELECT 1` / `PING`), retornar `latency_ms` e `server_version` ou erro limpo; verificar com teste de unidade usando fake de driver (abre, sonda, fecha) e teste manual quando houver instância real
-- [ ] 3.2 Implementar detecção de driver com `importlib.util.find_spec` (sem importar) por engine e mensagem de erro `driver_missing` com comando `install` (`uv pip install --python <sys.executable> <pkg>`); verificar forçando a ausência de um driver (ambiente sem ele) que só aquela engine reporta indisponível e as outras seguem funcionando
+- [x] 3.1 Implementar `test_connection()` por engine: abrir com os timeouts da conexão, probe mínimo (`SELECT 1` / `PING`), retornar `latency_ms` e `server_version` ou erro limpo; verificar com teste de unidade usando fake de driver (abre, sonda, fecha) e teste manual quando houver instância real — **probe real contra instância pendente (hostgator)**
+- [x] 3.2 Implementar detecção de driver com `importlib.util.find_spec` (sem importar) por engine e mensagem de erro `driver_missing` com comando `install` (`uv pip install --python <sys.executable> <pkg>`); verificar forçando a ausência de um driver (ambiente sem ele) que só aquela engine reporta indisponível e as outras seguem funcionando — **probe real contra instância pendente (hostgator)**
 
 ## 4. Rotas REST e eventos
 
