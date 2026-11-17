@@ -4,6 +4,9 @@
 // every element inside an array child carries a key (no React warnings).
 // State: useQuery + shared queryClient; events only invalidate — REST
 // (refetch + 5 s polling) is the source of truth.
+// i18n: plugin-scoped locale bundles via ctx.i18n.register + usePluginI18n
+// (same pattern as the bundled kanban plugin); components re-render on locale
+// switch, static surfaces (nav/palette) rebuild via ctx.i18n.onLocaleChange.
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 import { useCallback, useMemo, useState } from 'react'
 import {
@@ -30,6 +33,7 @@ import {
   pluginSettingsHref,
   queryClient,
   relativeTime,
+  usePluginI18n,
   useQuery,
 } from '@hermes/plugin-sdk'
 
@@ -47,17 +51,228 @@ const INVALIDATING_EVENTS = [
 ]
 
 const ENGINES = ['sqlserver', 'postgres', 'redis']
-const ENGINE_LABEL = { sqlserver: 'SQL Server', postgres: 'PostgreSQL', redis: 'Redis' }
 const ENVIRONMENTS = ['prod', 'homolog', 'local']
 const ENV_VARIANT = { prod: 'destructive', homolog: 'warn', local: 'muted' }
 const SECRET_VARIANT = { resolved: 'success', missing: 'destructive', unscoped: 'warn' }
 const STATUS_VARIANT = { running: 'default', ok: 'success', error: 'destructive' }
 const STATEMENT_DISPLAY_CHARS = 120
 
+// ------------------------------------------------------------ locale bundles
+
+const EN = {
+  nav: { bancos: 'Databases' },
+  palette: { abrir: 'Open Databases' },
+  chip: {
+    unavailable: 'databases unavailable',
+    label: (n, m) => n + (n === 1 ? ' query' : ' queries') + ' · ' + m + (m === 1 ? ' database' : ' databases'),
+    detailNone: 'no active queries',
+    detailConn: (n, id) => n + ' on ' + id,
+    titlePrefix: 'Databases: ',
+    ariaPrefix: 'Database activity: ',
+  },
+  engines: { sqlserver: 'SQL Server', postgres: 'PostgreSQL', redis: 'Redis' },
+  page: {
+    title: 'Databases',
+    drivers: 'Drivers',
+    connections: 'Connections',
+    sectionConnections: 'Connections (last access)',
+    sectionQueries: 'Recent queries',
+    refreshHint: 'refreshes every 5 s',
+    connActive: 'active query',
+    connIdle: 'idle',
+    connDisabled: ' · disabled',
+    secretSuffix: s => ' · secret ' + s,
+    lastAccess: 'Last access',
+    backendTitle: 'Plugin backend unavailable',
+    backendDesc: 'The plugin is not answering at /api/plugins/database-connector/. Enable it (plugins.enabled in the profile config), restart the gateway and reopen this page.',
+    errorDetail: d => 'Last error: ' + d,
+    partial: d => 'Partial failure: ' + d,
+  },
+  table: {
+    time: 'Time', connection: 'Connection', environment: 'Environment', engine: 'Engine',
+    statement: 'Statement', duration: 'Duration', status: 'Status', state: 'State',
+  },
+  empty: {
+    noConnectionsTitle: 'No connections configured',
+    noConnectionsDesc: 'Create connections in Settings ▸ Plugins ▸ Connections.',
+    noQueriesTitle: 'No queries yet',
+    noQueriesDesc: 'Agent queries (db_query / db_redis_command) show up here in real time.',
+  },
+  form: {
+    newTitle: 'New connection',
+    editTitle: 'Edit connection',
+    idLabel: 'id', idHint: 'unique slug, e.g. prod-sqlserver',
+    labelLabel: 'Display name', labelHint: 'optional',
+    engineLabel: 'Engine', envLabel: 'Environment', envHint: 'no default',
+    envPlaceholder: 'select (no default)', selectPlaceholder: 'select',
+    prodBadge: 'production — saving asks for confirmation',
+    hostLabel: 'Host', portLabel: 'Port', portHint: 'optional (number)',
+    databaseLabel: 'Database', databaseHint: 'required (db/schema)',
+    userLabel: 'User', userHint: 'optional; read-only user recommended',
+    secretLabel: 'secret_ref', secretHint: 'env var NAME — never the value',
+    enabledLabel: 'Enabled',
+    optionsTitle: 'Engine options',
+    driverLabel: 'Driver', driverHint: 'pymssql (default) or pyodbc',
+    instanceLabel: 'Instance', instanceHint: 'not applied in this version (pymssql uses host:port)',
+    encryptLabel: 'Encrypt', encryptHint: 'driver-fixed: pyodbc uses Encrypt=yes; pymssql via freetds.conf',
+    trustLabel: 'Trust the server certificate',
+    schemaLabel: 'Schema', schemaHint: 'not applied in this version (no search_path)',
+    sslmodeLabel: 'sslmode', sslmodeHint: 'driver default when empty',
+    dbIndexLabel: 'db_index', dbIndexHint: 'default 0',
+    tlsLabel: 'TLS',
+    save: 'Save', cancel: 'Cancel',
+    duplicate: 'Warning: a connection with the same engine + environment + host + database already exists.',
+    missingFields: fields => 'Fill the required fields: ' + fields,
+    confirmProdTitle: 'Save production connection?',
+    confirmProdDesc: id => 'Connection "' + id + '" will be stored with environment prod.',
+    confirmProdLabel: 'Save in production',
+    confirmFailed: 'Failed to save the connection — see the message on the form.',
+  },
+  list: {
+    title: 'Connections',
+    test: 'Test', edit: 'Edit', remove: 'Delete', create: 'New connection',
+    testing: 'testing…',
+    secretBadge: s => 'secret: ' + s,
+    envHint: 'Set the env var in Settings ▸ Environment. ',
+    openSettings: 'Open Settings',
+    deleteTitle: 'Delete connection?',
+    deleteDesc: id => 'Connection "' + id + '" and its whole query log will be deleted (cascade).',
+    deleteLabel: 'Delete',
+    deleteFailed: d => 'Failed to delete: ' + d,
+    emptyTitle: 'No connections',
+    emptyDesc: 'Create the first connection so the agent can query databases.',
+    unknownError: 'unknown',
+    failed: d => 'failed: ' + d,
+  },
+  drivers: {
+    title: 'Drivers',
+    available: 'available', missing: 'missing',
+    moduleSuffix: m => ' (module ' + m + ')',
+    withModule: m => ' · ' + m,
+    installNote: 'after installing, restart the gateway.',
+    copyTitle: 'Copy installation command',
+    note: 'Drivers come with the plugin install (python_dependencies); this screen only guides a host that is missing one of them.',
+    loading: 'loading…',
+    healthErrorTitle: 'Health unavailable',
+    healthErrorDesc: 'GET /health failed — the plugin backend must be enabled and the gateway restarted.',
+  },
+  misc: {
+    notRegistered: 'plugin database-connector not registered',
+    unknownFailure: 'unknown failure',
+    openSettings: 'Open Settings',
+  },
+}
+
+const PT_BR = {
+  nav: { bancos: 'Bancos' },
+  palette: { abrir: 'Abrir Bancos' },
+  chip: {
+    unavailable: 'bancos indisponível',
+    label: (n, m) => n + (n === 1 ? ' consulta' : ' consultas') + ' · ' + m + (m === 1 ? ' banco' : ' bancos'),
+    detailNone: 'nenhuma consulta ativa',
+    detailConn: (n, id) => n + ' em ' + id,
+    titlePrefix: 'Bancos: ',
+    ariaPrefix: 'Atividade de bancos: ',
+  },
+  engines: { sqlserver: 'SQL Server', postgres: 'PostgreSQL', redis: 'Redis' },
+  page: {
+    title: 'Bancos',
+    drivers: 'Drivers',
+    connections: 'Conexões',
+    sectionConnections: 'Conexões (último acesso)',
+    sectionQueries: 'Consultas recentes',
+    refreshHint: 'atualiza a cada 5 s',
+    connActive: 'consulta ativa',
+    connIdle: 'ociosa',
+    connDisabled: ' · desabilitada',
+    secretSuffix: s => ' · segredo ' + s,
+    lastAccess: 'Último acesso',
+    backendTitle: 'Backend do plugin indisponível',
+    backendDesc: 'O plugin não responde em /api/plugins/database-connector/. Habilite o plugin (plugins.enabled no config do perfil), reinicie o gateway e reabra a página.',
+    errorDetail: d => 'Último erro: ' + d,
+    partial: d => 'Falha parcial: ' + d,
+  },
+  table: {
+    time: 'Hora', connection: 'Conexão', environment: 'Ambiente', engine: 'Engine',
+    statement: 'Statement', duration: 'Duração', status: 'Status', state: 'Estado',
+  },
+  empty: {
+    noConnectionsTitle: 'Nenhuma conexão configurada',
+    noConnectionsDesc: 'Crie conexões em Settings ▸ Plugins ▸ Conexões.',
+    noQueriesTitle: 'Nenhuma consulta registrada',
+    noQueriesDesc: 'Consultas do agente (db_query / db_redis_command) aparecem aqui em tempo real.',
+  },
+  form: {
+    newTitle: 'Nova conexão',
+    editTitle: 'Editar conexão',
+    idLabel: 'id', idHint: 'slug único, ex.: prod-sqlserver',
+    labelLabel: 'Nome de exibição', labelHint: 'opcional',
+    engineLabel: 'Engine', envLabel: 'Ambiente', envHint: 'sem padrão',
+    envPlaceholder: 'selecione (sem padrão)', selectPlaceholder: 'selecione',
+    prodBadge: 'produção — exige confirmação ao salvar',
+    hostLabel: 'Host', portLabel: 'Porta', portHint: 'opcional (número)',
+    databaseLabel: 'Database', databaseHint: 'obrigatório (db/schema)',
+    userLabel: 'Usuário', userHint: 'opcional; recomendado somente-leitura',
+    secretLabel: 'secret_ref', secretHint: 'NOME da env var — nunca o valor',
+    enabledLabel: 'Habilitada',
+    optionsTitle: 'Opções da engine',
+    driverLabel: 'Driver', driverHint: 'pymssql (padrão) ou pyodbc',
+    instanceLabel: 'Instância', instanceHint: 'não aplicada nesta versão (pymssql usa host:porta)',
+    encryptLabel: 'Encrypt', encryptHint: 'fixo do driver: pyodbc usa Encrypt=yes; pymssql via freetds.conf',
+    trustLabel: 'Confiar no certificado do servidor',
+    schemaLabel: 'Schema', schemaHint: 'não aplicado nesta versão (sem search_path)',
+    sslmodeLabel: 'sslmode', sslmodeHint: 'padrão do driver quando vazio',
+    dbIndexLabel: 'db_index', dbIndexHint: 'padrão 0',
+    tlsLabel: 'TLS',
+    save: 'Salvar', cancel: 'Cancelar',
+    duplicate: 'Aviso: já existe uma conexão com a mesma engine + ambiente + host + database.',
+    missingFields: fields => 'Preencha os campos obrigatórios: ' + fields,
+    confirmProdTitle: 'Salvar conexão de produção?',
+    confirmProdDesc: id => 'A conexão "' + id + '" será gravada com environment prod.',
+    confirmProdLabel: 'Salvar em produção',
+    confirmFailed: 'Falha ao salvar a conexão — veja a mensagem no formulário.',
+  },
+  list: {
+    title: 'Conexões',
+    test: 'Testar', edit: 'Editar', remove: 'Excluir', create: 'Nova conexão',
+    testing: 'testando…',
+    secretBadge: s => 'segredo: ' + s,
+    envHint: 'Defina a env var em Settings ▸ Environment. ',
+    openSettings: 'Abrir Settings',
+    deleteTitle: 'Excluir conexão?',
+    deleteDesc: id => 'A conexão "' + id + '" e todo o seu log de consultas serão apagados (cascade).',
+    deleteLabel: 'Excluir',
+    deleteFailed: d => 'Falha ao excluir: ' + d,
+    emptyTitle: 'Nenhuma conexão',
+    emptyDesc: 'Crie a primeira conexão para o agente consultar bancos.',
+    unknownError: 'desconhecido',
+    failed: d => 'falhou: ' + d,
+  },
+  drivers: {
+    title: 'Drivers',
+    available: 'disponível', missing: 'faltando',
+    moduleSuffix: m => ' (módulo ' + m + ')',
+    withModule: m => ' · ' + m,
+    installNote: 'depois de instalar, reinicie o gateway.',
+    copyTitle: 'Copiar comando de instalação',
+    note: 'Drivers chegam com o install do plugin (python_dependencies); esta tela orienta só o host que ficou sem algum deles.',
+    loading: 'carregando…',
+    healthErrorTitle: 'Health indisponível',
+    healthErrorDesc: 'GET /health falhou — o backend do plugin precisa estar habilitado e o gateway reiniciado.',
+  },
+  misc: {
+    notRegistered: 'plugin database-connector não registrado',
+    unknownFailure: 'falha desconhecida',
+    openSettings: 'Abrir Settings',
+  },
+}
+
+const LOCALES = { en: EN, 'pt-BR': PT_BR }
+
 // ctx.rest only exists on the register() context; components capture it here.
 let rest = null
 function api(path, opts) {
-  if (!rest) return Promise.reject(new Error('plugin database-connector não registrado'))
+  if (!rest) return Promise.reject(new Error('plugin database-connector not registered'))
   return rest(path, opts)
 }
 
@@ -87,7 +302,7 @@ function invalidateAll() {
   queryClient.invalidateQueries({ queryKey: QK })
 }
 
-async function readError(exc) {
+function readError(exc) {
   // REST failures arrive as { error, detail }; ctx.rest may reject with the
   // body packed into exc.message ("409: {json}") — unwrap the trailing JSON.
   const detail = exc && (exc.detail || exc.error || exc.message)
@@ -101,7 +316,7 @@ async function readError(exc) {
     }
     return detail
   }
-  return 'falha desconhecida'
+  return null
 }
 
 // ---------------------------------------------------------------- helpers
@@ -180,6 +395,7 @@ function Section({ title, action, children }) {
 // ------------------------------------------------------- status bar chip
 
 export function StatusChip() {
+  const t = usePluginI18n(PLUGIN_ID)
   const { data, isError } = useStatus()
   const active = Array.isArray(data?.active) ? data.active : []
   const byConn = new Map()
@@ -187,16 +403,15 @@ export function StatusChip() {
     byConn.set(row.connection_id, (byConn.get(row.connection_id) ?? 0) + 1)
   }
   const detail = byConn.size
-    ? [...byConn].map(([id, n]) => n + ' em ' + id).join(', ')
-    : 'nenhuma consulta ativa'
+    ? [...byConn].map(([id, n]) => t('chip.detailConn', n, id)).join(', ')
+    : t('chip.detailNone')
   const label = isError
-    ? 'bancos indisponível'
-    : active.length + (active.length === 1 ? ' consulta' : ' consultas') +
-      ' · ' + byConn.size + (byConn.size === 1 ? ' banco' : ' bancos')
+    ? t('chip.unavailable')
+    : t('chip.label', active.length, byConn.size)
   return jsxs('button', {
     onClick: () => host.navigate(PAGE_PATH),
-    title: 'Bancos: ' + detail,
-    'aria-label': 'Atividade de bancos: ' + detail,
+    title: t('chip.titlePrefix') + detail,
+    'aria-label': t('chip.ariaPrefix') + detail,
     style: {
       display: 'inline-flex',
       alignItems: 'center',
@@ -218,15 +433,15 @@ export function StatusChip() {
 
 // ------------------------------------------------------ activity page
 
-function ConnectionStatesCard({ connections, queries, activeIds }) {
+function ConnectionStatesCard({ t, connections, queries, activeIds }) {
   const lastUse = new Map()
   for (const row of queries) {
     if (!lastUse.has(row.connection_id)) lastUse.set(row.connection_id, row.ts)
   }
   if (!connections.length) {
     return jsx(EmptyState, {
-      title: 'Nenhuma conexão configurada',
-      description: 'Crie conexões em Settings ▸ Plugins ▸ Conexões.',
+      title: t('empty.noConnectionsTitle'),
+      description: t('empty.noConnectionsDesc'),
     })
   }
   return jsx('table', {
@@ -234,7 +449,7 @@ function ConnectionStatesCard({ connections, queries, activeIds }) {
     children: [
       jsx(TableHead, {
         key: 'head',
-        columns: ['Conexão', 'Ambiente', 'Engine', 'Estado', 'Último acesso'],
+        columns: [t('table.connection'), t('table.environment'), t('table.engine'), t('table.state'), t('page.lastAccess')],
       }),
       jsx('tbody', {
         key: 'body',
@@ -247,16 +462,16 @@ function ConnectionStatesCard({ connections, queries, activeIds }) {
                 c.label !== c.id
                   ? jsxs(Fragment, { key: 'main', children: [c.label, ' ', jsx('span', { key: 'id', style: mutedStyle, children: '(' + c.id + ')' })] })
                   : c.id,
-                c.enabled ? null : jsx('span', { key: 'off', style: mutedStyle, children: ' · desabilitada' }),
+                c.enabled ? null : jsx('span', { key: 'off', style: mutedStyle, children: t('page.connDisabled') }),
               ] }),
               jsx('td', { key: 'env', style: cellStyle, children: jsx(EnvBadge, { environment: c.environment }) }),
-              jsx('td', { key: 'engine', style: cellStyle, children: ENGINE_LABEL[c.engine] || c.engine }),
+              jsx('td', { key: 'engine', style: cellStyle, children: ENGINES.includes(c.engine) ? t('engines.' + c.engine) : c.engine }),
               jsxs('td', { key: 'state', style: cellStyle, children: [
                 jsx(StatusDot, { key: 'dot', tone: activeIds.has(c.id) ? 'good' : 'muted' }),
                 ' ',
-                activeIds.has(c.id) ? 'consulta ativa' : 'ociosa',
+                activeIds.has(c.id) ? t('page.connActive') : t('page.connIdle'),
                 c.secret_state && c.secret_state !== 'resolved'
-                  ? ' · segredo ' + c.secret_state
+                  ? t('page.secretSuffix', c.secret_state)
                   : null,
               ] }),
               jsx('td', { key: 'last', style: cellStyle, children: lastUse.has(c.id) ? relativeTime(Date.parse(lastUse.get(c.id))) : '—' }),
@@ -269,6 +484,7 @@ function ConnectionStatesCard({ connections, queries, activeIds }) {
 }
 
 export function ActivityPage() {
+  const t = usePluginI18n(PLUGIN_ID)
   const statusQ = useStatus()
   const queriesQ = useQueriesList()
   const connsQ = useConnections()
@@ -276,44 +492,61 @@ export function ActivityPage() {
   const activeIds = useMemo(() => new Set(active.map((r) => r.connection_id)), [statusQ.data])
   const queries = Array.isArray(queriesQ.data?.queries) ? queriesQ.data.queries : []
   const connections = Array.isArray(connsQ.data?.connections) ? connsQ.data.connections : []
-  const failed = statusQ.isError || queriesQ.isError
-  if (failed) {
+  const statusFailed = statusQ.isError
+  const queriesFailed = queriesQ.isError
+  // Full-page error only when BOTH canonical reads fail (no flip-flopping when
+  // a single endpoint hiccups); a single failure degrades to a banner.
+  if (statusFailed && queriesFailed) {
+    const detail = readError(statusQ.error) || readError(queriesQ.error)
     return jsxs('div', { style: { padding: 24 }, children: [
-      jsx('h2', { key: 'title', style: { marginTop: 0 }, children: 'Bancos' }),
+      jsx('h2', { key: 'title', style: { marginTop: 0 }, children: t('page.title') }),
       jsx(ErrorState, {
         key: 'error',
-        title: 'Backend do plugin indisponível',
+        title: t('page.backendTitle'),
         description:
-          'O plugin não responde em /api/plugins/database-connector/. ' +
-          'Habilite o plugin (plugins.enabled no config do perfil), reinicie o gateway e reabra a página.',
+          t('page.backendDesc') + (detail ? '\n' + t('page.errorDetail', truncate(detail, 160)) : ''),
       }),
     ] })
   }
+  const banner = (statusFailed || queriesFailed)
+    ? t('page.partial', truncate(readError(statusFailed ? statusQ.error : queriesQ.error) || '', 160))
+    : null
   return jsxs('div', { style: { padding: 24 }, children: [
+    banner
+      ? jsx('div', {
+          key: 'banner',
+          style: {
+            margin: '0 0 12px', padding: '6px 10px', fontSize: 12, borderRadius: 8,
+            border: '1px solid var(--ui-stroke-secondary)',
+            color: 'var(--ui-text-secondary)',
+          },
+          children: banner,
+        })
+      : null,
     jsxs('div', { key: 'header', style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
-      jsx('h2', { key: 'title', style: { margin: '0 0 16px' }, children: 'Bancos' }),
+      jsx('h2', { key: 'title', style: { margin: '0 0 16px' }, children: t('page.title') }),
       jsx(Button, {
         key: 'drivers',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'drivers')),
-        children: 'Drivers',
+        children: t('page.drivers'),
       }),
       jsx(Button, {
         key: 'conns',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'connections')),
-        children: 'Conexões',
+        children: t('page.connections'),
       }),
     ] }),
     jsx(Section, {
       key: 'connections',
-      title: 'Conexões (último acesso)',
-      children: jsx(ConnectionStatesCard, { connections, queries, activeIds }),
+      title: t('page.sectionConnections'),
+      children: jsx(ConnectionStatesCard, { t, connections, queries, activeIds }),
     }),
     jsx(Section, {
       key: 'queries',
-      title: 'Consultas recentes',
-      action: jsx('span', { key: 'hint', style: mutedStyle, children: 'atualiza a cada 5 s' }),
+      title: t('page.sectionQueries'),
+      action: jsx('span', { key: 'hint', style: mutedStyle, children: t('page.refreshHint') }),
       children: queries.length
         ? jsx(LogView, {
             children: jsx('table', {
@@ -321,7 +554,7 @@ export function ActivityPage() {
               children: [
                 jsx(TableHead, {
                   key: 'head',
-                  columns: ['Hora', 'Conexão', 'Ambiente', 'Engine', 'Statement', 'Duração', 'Status'],
+                  columns: [t('table.time'), t('table.connection'), t('table.environment'), t('table.engine'), t('table.statement'), t('table.duration'), t('table.status')],
                 }),
                 jsx('tbody', {
                   key: 'body',
@@ -333,7 +566,7 @@ export function ActivityPage() {
                         jsx('td', { key: 'time', style: cellStyle, title: q.ts, children: fmtTime(q.ts) }),
                         jsx('td', { key: 'conn', style: cellStyle, children: q.connection_id }),
                         jsx('td', { key: 'env', style: cellStyle, children: q.environment }),
-                        jsx('td', { key: 'engine', style: cellStyle, children: ENGINE_LABEL[q.engine] || q.engine }),
+                        jsx('td', { key: 'engine', style: cellStyle, children: ENGINES.includes(q.engine) ? t('engines.' + q.engine) : q.engine }),
                         jsx('td', {
                           key: 'stmt',
                           style: { ...cellStyle, color: 'var(--ui-text-tertiary)' },
@@ -350,8 +583,8 @@ export function ActivityPage() {
             }),
           })
         : jsx(EmptyState, {
-            title: 'Nenhuma consulta registrada',
-            description: 'Consultas do agente (db_query / db_redis_command) aparecem aqui em tempo real.',
+            title: t('empty.noQueriesTitle'),
+            description: t('empty.noQueriesDesc'),
           }),
     }),
   ] })
@@ -372,27 +605,27 @@ function Field({ label, hint, children }) {
   })
 }
 
-function EngineSelect({ value, onChange }) {
+function EngineSelect({ t, value, onChange }) {
   return jsx(Select, {
     value: value || undefined,
     onValueChange: onChange,
     children: [
-      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
+      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: t('form.selectPlaceholder') }) }),
       jsx(SelectContent, {
         key: 'content',
         children: ENGINES.map((engine) =>
-          jsx(SelectItem, { key: engine, value: engine, children: ENGINE_LABEL[engine] })),
+          jsx(SelectItem, { key: engine, value: engine, children: t('engines.' + engine) })),
       }),
     ],
   })
 }
 
-function EnvironmentSelect({ value, onChange }) {
+function EnvironmentSelect({ t, value, onChange }) {
   return jsx(Select, {
     value: value || undefined,
     onValueChange: onChange,
     children: [
-      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione (sem padrão)' }) }),
+      jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: t('form.envPlaceholder') }) }),
       jsx(SelectContent, {
         key: 'content',
         children: ENVIRONMENTS.map((env) => jsx(SelectItem, { key: env, value: env, children: env })),
@@ -405,30 +638,27 @@ function EnvironmentSelect({ value, onChange }) {
 // Fields the drivers of this version do NOT consume are rendered disabled with
 // an honest hint — the user must never believe they configured something the
 // backend silently ignores (review P1, 2026-11-17).
-function EngineOptionsFields({ engine, options, setOption }) {
+function EngineOptionsFields({ t, engine, options, setOption }) {
   if (engine === 'sqlserver') {
     return jsxs(Fragment, { children: [
       jsx(Field, {
         key: 'driver',
-        label: 'Driver',
-        hint: 'pymssql (padrão) ou pyodbc',
+        label: t('form.driverLabel'), hint: t('form.driverHint'),
         children: jsx(Input, { style: controlStyle, value: options.driver ?? '', onChange: (e) => setOption('driver', e.target.value) }),
       }),
       jsx(Field, {
         key: 'instance',
-        label: 'Instância',
-        hint: 'não aplicada nesta versão (pymssql usa host:porta)',
+        label: t('form.instanceLabel'), hint: t('form.instanceHint'),
         children: jsx(Input, { style: controlStyle, value: options.instance ?? '', disabled: true }),
       }),
       jsx(Field, {
         key: 'encrypt',
-        label: 'Encrypt',
-        hint: 'fixo do driver: pyodbc usa Encrypt=yes; pymssql via freetds.conf',
+        label: t('form.encryptLabel'), hint: t('form.encryptHint'),
         children: jsx(Input, { style: controlStyle, value: options.encrypt ?? '', disabled: true }),
       }),
       jsx(Field, {
         key: 'trust',
-        label: 'Confiar no certificado do servidor',
+        label: t('form.trustLabel'),
         children: jsx(Switch, { checked: !!options.trust_server_certificate, onCheckedChange: (v) => setOption('trust_server_certificate', v) }),
       }),
     ] })
@@ -437,19 +667,17 @@ function EngineOptionsFields({ engine, options, setOption }) {
     return jsxs(Fragment, { children: [
       jsx(Field, {
         key: 'schema',
-        label: 'Schema',
-        hint: 'não aplicado nesta versão (sem search_path)',
+        label: t('form.schemaLabel'), hint: t('form.schemaHint'),
         children: jsx(Input, { style: controlStyle, value: options.schema ?? '', disabled: true }),
       }),
       jsx(Field, {
         key: 'sslmode',
-        label: 'sslmode',
-        hint: 'padrão do driver quando vazio',
+        label: t('form.sslmodeLabel'), hint: t('form.sslmodeHint'),
         children: jsx(Select, {
           value: options.sslmode || undefined,
           onValueChange: (v) => setOption('sslmode', v),
           children: [
-            jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: 'selecione' }) }),
+            jsx(SelectTrigger, { key: 'trigger', style: controlStyle, children: jsx(SelectValue, { placeholder: t('form.selectPlaceholder') }) }),
             jsx(SelectContent, {
               key: 'content',
               children: ['disable', 'prefer', 'require', 'verify-full'].map((mode) =>
@@ -464,13 +692,12 @@ function EngineOptionsFields({ engine, options, setOption }) {
     return jsxs(Fragment, { children: [
       jsx(Field, {
         key: 'db_index',
-        label: 'db_index',
-        hint: 'padrão 0',
+        label: t('form.dbIndexLabel'), hint: t('form.dbIndexHint'),
         children: jsx(Input, { style: controlStyle, value: options.db_index ?? '', onChange: (e) => setOption('db_index', e.target.value) }),
       }),
       jsx(Field, {
         key: 'tls',
-        label: 'TLS',
+        label: t('form.tlsLabel'),
         children: jsx(Switch, { checked: !!options.tls, onCheckedChange: (v) => setOption('tls', v) }),
       }),
     ] })
@@ -488,10 +715,10 @@ function requiredMissing(form, options = {}) {
     missing.push('database')
   }
   const port = String(form.port).trim()
-  if (port !== '' && !Number.isFinite(Number(port))) missing.push('porta (número)')
+  if (port !== '' && !Number.isFinite(Number(port))) missing.push('port')
   if (form.engine === 'redis') {
     const dbIndex = String(options.db_index ?? '').trim()
-    if (dbIndex !== '' && !Number.isFinite(Number(dbIndex))) missing.push('db_index (número)')
+    if (dbIndex !== '' && !Number.isFinite(Number(dbIndex))) missing.push('db_index')
   }
   return missing
 }
@@ -525,6 +752,7 @@ function connectionPayload(form, options) {
 }
 
 export function ConnectionForm({ initial, connections, onDone }) {
+  const t = usePluginI18n(PLUGIN_ID)
   const editing = !!(initial && initial.id)
   const [form, setForm] = useState(() => ({
     id: initial?.id ?? '',
@@ -560,7 +788,7 @@ export function ConnectionForm({ initial, connections, onDone }) {
     setError(null)
     const missing = requiredMissing(form, options)
     if (missing.length) {
-      setError('Preencha os campos obrigatórios: ' + missing.join(', '))
+      setError(t('form.missingFields', missing.join(', ')))
       return false
     }
     const body = connectionPayload(form, options)
@@ -574,10 +802,10 @@ export function ConnectionForm({ initial, connections, onDone }) {
       onDone()
       return true
     } catch (exc) {
-      setError(await readError(exc))
+      setError(readError(exc) || 'error')
       return false
     }
-  }, [form, options, editing, onDone])
+  }, [form, options, editing, onDone, t])
 
   const submit = () => {
     if (requiredMissing(form, options).length) {
@@ -590,67 +818,53 @@ export function ConnectionForm({ initial, connections, onDone }) {
   }
 
   return jsxs('div', { children: [
-    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: editing ? 'Editar conexão' : 'Nova conexão' }),
+    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: editing ? t('form.editTitle') : t('form.newTitle') }),
     jsxs('div', { key: 'fields', style: { display: 'flex', gap: 16, flexWrap: 'wrap' }, children: [
       jsxs('div', { key: 'common', children: [
         jsx(Field, {
-          key: 'id',
-          label: 'id',
-          hint: 'slug único, ex.: prod-sqlserver',
+          key: 'id', label: t('form.idLabel'), hint: t('form.idHint'),
           children: jsx(Input, { style: controlStyle, value: form.id, disabled: editing, onChange: (e) => setField('id')(e.target.value) }),
         }),
         jsx(Field, {
-          key: 'label',
-          label: 'Nome de exibição',
-          hint: 'opcional',
+          key: 'label', label: t('form.labelLabel'), hint: t('form.labelHint'),
           children: jsx(Input, { style: controlStyle, value: form.label, onChange: (e) => setField('label')(e.target.value) }),
         }),
-        jsx(Field, { key: 'engine', label: 'Engine', children: jsx(EngineSelect, { value: form.engine, onChange: setField('engine') }) }),
-        jsx(Field, { key: 'environment', label: 'Ambiente', hint: 'sem padrão', children: jsx(EnvironmentSelect, { value: form.environment, onChange: setField('environment') }) }),
+        jsx(Field, { key: 'engine', label: t('form.engineLabel'), children: jsx(EngineSelect, { t, value: form.engine, onChange: setField('engine') }) }),
+        jsx(Field, { key: 'environment', label: t('form.envLabel'), hint: t('form.envHint'), children: jsx(EnvironmentSelect, { t, value: form.environment, onChange: setField('environment') }) }),
         form.environment === 'prod'
-          ? jsx('div', { key: 'prodbadge', style: { marginBottom: 10 }, children: jsx(Badge, { variant: 'destructive', children: 'produção — exige confirmação ao salvar' }) })
+          ? jsx('div', { key: 'prodbadge', style: { marginBottom: 10 }, children: jsx(Badge, { variant: 'destructive', children: t('form.prodBadge') }) })
           : null,
         jsx(Field, {
-          key: 'host',
-          label: 'Host',
+          key: 'host', label: t('form.hostLabel'),
           children: jsx(Input, { style: controlStyle, value: form.host, onChange: (e) => setField('host')(e.target.value) }),
         }),
         jsx(Field, {
-          key: 'port',
-          label: 'Porta',
-          hint: 'opcional (número)',
+          key: 'port', label: t('form.portLabel'), hint: t('form.portHint'),
           children: jsx(Input, { style: controlStyle, value: form.port, onChange: (e) => setField('port')(e.target.value) }),
         }),
         form.engine === 'redis'
           ? null
           : jsx(Field, {
-              key: 'database',
-              label: 'Database',
-              hint: 'obrigatório (db/schema)',
+              key: 'database', label: t('form.databaseLabel'), hint: t('form.databaseHint'),
               children: jsx(Input, { style: controlStyle, value: form.database, onChange: (e) => setField('database')(e.target.value) }),
             }),
         jsx(Field, {
-          key: 'username',
-          label: 'Usuário',
-          hint: 'opcional; recomendado somente-leitura',
+          key: 'username', label: t('form.userLabel'), hint: t('form.userHint'),
           children: jsx(Input, { style: controlStyle, value: form.username, onChange: (e) => setField('username')(e.target.value) }),
         }),
         jsx(Field, {
-          key: 'secret',
-          label: 'secret_ref',
-          hint: 'NOME da env var — nunca o valor',
+          key: 'secret', label: t('form.secretLabel'), hint: t('form.secretHint'),
           children: jsx(Input, { style: controlStyle, value: form.secret_ref, onChange: (e) => setField('secret_ref')(e.target.value) }),
         }),
         jsx(Field, {
-          key: 'enabled',
-          label: 'Habilitada',
+          key: 'enabled', label: t('form.enabledLabel'),
           children: jsx(Switch, { checked: form.enabled, onCheckedChange: setField('enabled') }),
         }),
       ] }),
       form.engine
         ? jsxs('div', { key: 'engine', children: [
-            jsx('div', { key: 'opttitle', style: { fontSize: 12, color: 'var(--ui-text-secondary)', marginBottom: 10 }, children: 'Opções da engine' }),
-            jsx(EngineOptionsFields, { engine: form.engine, options, setOption }),
+            jsx('div', { key: 'opttitle', style: { fontSize: 12, color: 'var(--ui-text-secondary)', marginBottom: 10 }, children: t('form.optionsTitle') }),
+            jsx(EngineOptionsFields, { t, engine: form.engine, options, setOption }),
           ] })
         : null,
     ] }),
@@ -658,15 +872,15 @@ export function ConnectionForm({ initial, connections, onDone }) {
       ? jsx('div', {
           key: 'duplicate',
           style: { margin: '8px 0', color: 'var(--ui-text-secondary)', fontSize: 12 },
-          children: 'Aviso: já existe uma conexão com a mesma engine + ambiente + host + database.',
+          children: t('form.duplicate'),
         })
       : null,
     error
       ? jsx('div', { key: 'error', style: { margin: '8px 0', color: 'var(--ui-text-secondary)', fontSize: 12 }, children: error })
       : null,
     jsxs('div', { key: 'actions', style: { display: 'flex', gap: 8 }, children: [
-      jsx(Button, { key: 'save', onClick: submit, children: 'Salvar' }),
-      jsx(Button, { key: 'cancel', variant: 'ghost', onClick: onDone, children: 'Cancelar' }),
+      jsx(Button, { key: 'save', onClick: submit, children: t('form.save') }),
+      jsx(Button, { key: 'cancel', variant: 'ghost', onClick: onDone, children: t('form.cancel') }),
     ] }),
     jsx(ConfirmDialog, {
       key: 'confirm',
@@ -675,25 +889,26 @@ export function ConnectionForm({ initial, connections, onDone }) {
       onConfirm: async () => {
         if (!(await save())) {
           // Keep the dialog open; the form behind shows the reason.
-          throw new Error('Falha ao salvar a conexão — veja a mensagem no formulário.')
+          throw new Error(t('form.confirmFailed'))
         }
       },
-      title: 'Salvar conexão de produção?',
-      description: 'A conexão "' + (form.id || form.label) + '" será gravada com environment prod.',
-      confirmLabel: 'Salvar em produção',
+      title: t('form.confirmProdTitle'),
+      description: t('form.confirmProdDesc', form.id || form.label),
+      confirmLabel: t('form.confirmProdLabel'),
     }),
   ] })
 }
 
-function SecretStateBadge({ state }) {
+function SecretStateBadge({ t, state }) {
   if (!state) return null
   return jsxs(Fragment, { children: [
     ' ',
-    jsx(Badge, { key: 'badge', variant: SECRET_VARIANT[state] || 'outline', children: 'segredo: ' + state }),
+    jsx(Badge, { key: 'badge', variant: SECRET_VARIANT[state] || 'outline', children: t('list.secretBadge', state) }),
   ] })
 }
 
 export function ConnectionsManager({ connections: connectionsProp }) {
+  const t = usePluginI18n(PLUGIN_ID)
   const connsQ = useConnections()
   const connections = connectionsProp ??
     (Array.isArray(connsQ.data?.connections) ? connsQ.data.connections : [])
@@ -709,23 +924,24 @@ export function ConnectionsManager({ connections: connectionsProp }) {
       await api('/connections/' + encodeURIComponent(target.id), { method: 'DELETE' })
       refresh()
     } catch (exc) {
-      host.notify?.({ kind: 'error', message: 'Falha ao excluir: ' + (await readError(exc)) })
+      const detail = readError(exc)
+      host.notify?.({ kind: 'error', message: t('list.deleteFailed', detail || '') })
     } finally {
       setDeleting(null)
     }
   }
 
   const doTest = async (c) => {
-    setTests((t) => ({ ...t, [c.id]: 'busy' }))
+    setTests((t2) => ({ ...t2, [c.id]: 'busy' }))
     try {
       const result = await api('/connections/' + encodeURIComponent(c.id) + '/test', { method: 'POST' })
-      setTests((t) => ({
-        ...t,
-        [c.id]: result?.ok ? 'ok (' + fmtDuration(result.latency_ms) + ')' : 'falhou: ' + (result?.error ?? 'desconhecido'),
+      setTests((t2) => ({
+        ...t2,
+        [c.id]: result?.ok ? 'ok (' + fmtDuration(result.latency_ms) + ')' : t('list.failed', result?.error ?? t('list.unknownError')),
       }))
     } catch (exc) {
-      const detail = await readError(exc)
-      setTests((t) => ({ ...t, [c.id]: 'falhou: ' + detail }))
+      const detail = readError(exc)
+      setTests((t2) => ({ ...t2, [c.id]: t('list.failed', detail || '') }))
     }
   }
 
@@ -739,12 +955,12 @@ export function ConnectionsManager({ connections: connectionsProp }) {
 
   return jsxs('div', { children: [
     jsxs('div', { key: 'header', style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
-      jsx('h3', { key: 'title', style: { margin: '0 0 12px' }, children: 'Conexões' }),
+      jsx('h3', { key: 'title', style: { margin: '0 0 12px' }, children: t('list.title') }),
       jsx(Button, {
         key: 'drivers',
         variant: 'ghost',
         onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'drivers')),
-        children: 'Drivers',
+        children: t('page.drivers'),
       }),
     ] }),
     connections.length
@@ -762,13 +978,13 @@ export function ConnectionsManager({ connections: connectionsProp }) {
                     c.label !== c.id ? jsx('span', { key: 'id', style: mutedStyle, children: ' (' + c.id + ')' }) : null,
                   ] }),
                   jsxs('td', { key: 'badges', style: cellStyle, children: [
-                    jsx(Badge, { key: 'engine', variant: 'outline', children: ENGINE_LABEL[c.engine] || c.engine }),
+                    jsx(Badge, { key: 'engine', variant: 'outline', children: ENGINES.includes(c.engine) ? t('engines.' + c.engine) : c.engine }),
                     ' ',
                     jsx(EnvBadge, { key: 'env', environment: c.environment }),
-                    jsx(SecretStateBadge, { key: 'secret', state: c.secret_state }),
+                    jsx(SecretStateBadge, { key: 'secret', t, state: c.secret_state }),
                     c.secret_state && c.secret_state !== 'resolved'
                       ? jsxs('div', { key: 'hint', style: mutedStyle, children: [
-                          'Defina a env var em Settings ▸ Environment. ',
+                          t('list.envHint'),
                           jsx('button', {
                             key: 'open',
                             style: {
@@ -781,7 +997,7 @@ export function ConnectionsManager({ connections: connectionsProp }) {
                               fontSize: 12,
                             },
                             onClick: () => host.navigate('/settings'),
-                            children: 'Abrir Settings',
+                            children: t('list.openSettings'),
                           }),
                         ] })
                       : null,
@@ -789,13 +1005,13 @@ export function ConnectionsManager({ connections: connectionsProp }) {
                   jsxs('td', { key: 'target', style: cellStyle, children: [
                     jsx('span', { key: 'host', style: mutedStyle, children: c.host + (c.port ? ':' + c.port : '') }),
                     c.database ? jsx('span', { key: 'db', style: mutedStyle, children: ' · ' + c.database }) : null,
-                    jsx('div', { key: 'test', style: mutedStyle, children: tests[c.id] === 'busy' ? 'testando…' : (tests[c.id] ?? '') }),
+                    jsx('div', { key: 'test', style: mutedStyle, children: tests[c.id] === 'busy' ? t('list.testing') : (tests[c.id] ?? '') }),
                   ] }),
                   jsxs('td', { key: 'actions', style: cellStyle, children: [
                     jsxs('div', { key: 'row', style: { display: 'flex', gap: 6 }, children: [
-                      jsx(Button, { key: 'test', variant: 'secondary', onClick: () => void doTest(c), children: 'Testar' }),
-                      jsx(Button, { key: 'edit', variant: 'ghost', onClick: () => setEditing(c), children: 'Editar' }),
-                      jsx(Button, { key: 'delete', variant: 'ghost', onClick: () => setDeleting(c), children: 'Excluir' }),
+                      jsx(Button, { key: 'test', variant: 'secondary', onClick: () => void doTest(c), children: t('list.test') }),
+                      jsx(Button, { key: 'edit', variant: 'ghost', onClick: () => setEditing(c), children: t('list.edit') }),
+                      jsx(Button, { key: 'ghost-delete', variant: 'ghost', onClick: () => setDeleting(c), children: t('list.remove') }),
                     ] }),
                   ] }),
                 ],
@@ -805,37 +1021,38 @@ export function ConnectionsManager({ connections: connectionsProp }) {
         })
       : jsx(EmptyState, {
           key: 'empty',
-          title: 'Nenhuma conexão',
-          description: 'Crie a primeira conexão para o agente consultar bancos.',
+          title: t('list.emptyTitle'),
+          description: t('list.emptyDesc'),
         }),
-    jsx('div', { key: 'new', style: { marginTop: 12 }, children: jsx(Button, { onClick: () => setEditing('new'), children: 'Nova conexão' }) }),
+    jsx('div', { key: 'new', style: { marginTop: 12 }, children: jsx(Button, { onClick: () => setEditing('new'), children: t('list.create') }) }),
     jsx(ConfirmDialog, {
       key: 'confirm',
       open: !!deleting,
       onClose: () => setDeleting(null),
       onConfirm: doDelete,
       destructive: true,
-      title: 'Excluir conexão?',
-      description: 'A conexão "' + (deleting?.id ?? '') + '" e todo o seu log de consultas serão apagados (cascade).',
-      confirmLabel: 'Excluir',
+      title: t('list.deleteTitle'),
+      description: t('list.deleteDesc', deleting?.id ?? ''),
+      confirmLabel: t('list.deleteLabel'),
     }),
   ] })
 }
 
 export function DriversPage({ health }) {
+  const t = usePluginI18n(PLUGIN_ID)
   const healthQ = useHealth()
   const engines = health?.engines ?? healthQ.data?.engines
   if (!engines) {
     if (healthQ.isError) {
       return jsx(ErrorState, {
-        title: 'Health indisponível',
-        description: 'GET /health falhou — o backend do plugin precisa estar habilitado e o gateway reiniciado.',
+        title: t('drivers.healthErrorTitle'),
+        description: t('drivers.healthErrorDesc'),
       })
     }
-    return jsx('div', { style: mutedStyle, children: 'carregando…' })
+    return jsx('div', { style: mutedStyle, children: t('drivers.loading') })
   }
   return jsxs('div', { children: [
-    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: 'Drivers' }),
+    jsx('h3', { key: 'title', style: { marginTop: 0 }, children: t('drivers.title') }),
     jsx('table', {
       key: 'table',
       style: tableStyle,
@@ -849,14 +1066,14 @@ export function DriversPage({ health }) {
               jsxs('td', { key: 'name', style: cellStyle, children: [
                 jsx(StatusDot, { key: 'dot', tone: info.available ? 'good' : 'bad' }),
                 ' ',
-                jsx('strong', { key: 'label', children: ENGINE_LABEL[engine] || engine }),
+                jsx('strong', { key: 'label', children: ENGINES.includes(engine) ? t('engines.' + engine) : engine }),
               ] }),
               jsxs('td', { key: 'status', style: cellStyle, children: [
                 info.available
-                  ? 'disponível' + (info.module ? ' · ' + info.module : '')
+                  ? t('drivers.available') + (info.module ? t('drivers.withModule', info.module) : '')
                   : jsxs(Fragment, { key: 'missing', children: [
-                      'faltando',
-                      info.module ? jsx('span', { key: 'module', style: mutedStyle, children: ' (módulo ' + info.module + ')' }) : null,
+                      t('drivers.missing'),
+                      info.module ? jsx('span', { key: 'module', style: mutedStyle, children: t('drivers.moduleSuffix', info.module) }) : null,
                     ] }),
               ] }),
               jsxs('td', { key: 'install', style: cellStyle, children: [
@@ -865,8 +1082,8 @@ export function DriversPage({ health }) {
                   : jsxs(Fragment, { key: 'cmd', children: [
                       jsx('code', { key: 'code', style: { fontSize: 11 }, children: info.install }),
                       ' ',
-                      jsx(CopyButton, { key: 'copy', text: info.install, title: 'Copiar comando de instalação' }),
-                      jsx('div', { key: 'note', style: mutedStyle, children: 'depois de instalar, reinicie o gateway.' }),
+                      jsx(CopyButton, { key: 'copy', text: info.install, title: t('drivers.copyTitle') }),
+                      jsx('div', { key: 'note', style: mutedStyle, children: t('drivers.installNote') }),
                     ] }),
               ] }),
             ],
@@ -877,7 +1094,7 @@ export function DriversPage({ health }) {
     jsx('p', {
       key: 'note',
       style: mutedStyle,
-      children: 'Drivers chegam com o install do plugin (python_dependencies); esta tela orienta só o host que ficou sem algum deles.',
+      children: t('drivers.note'),
     }),
   ] })
 }
@@ -889,6 +1106,9 @@ export default {
   name: 'Database Connector',
   register(ctx) {
     rest = ctx.rest.bind(ctx)
+    // Plugin-scoped locale bundles (en fallback + pt-BR), dropped by the host
+    // on unload/reload/disable together with every other registration.
+    ctx.i18n?.register?.(LOCALES)
     // Nothing long-lived here: onEvent disposers and onDispose are retired by
     // the host on unload/reload/disable (SDK contract).
     for (const name of INVALIDATING_EVENTS) {
@@ -899,27 +1119,41 @@ export default {
     ctx.onDispose(() => {
       rest = null
     })
-    ctx.registerMany([
-      { id: 'page', area: ROUTES_AREA, data: { path: PAGE_PATH }, render: () => jsx(ActivityPage, {}) },
-      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: PAGE_PATH, label: 'Bancos', codicon: 'database' } },
-      { id: 'chip', area: STATUSBAR_AREAS.right, order: 120, render: () => jsx(StatusChip, {}) },
-      {
+    // Static surfaces (sidebar row + palette row) carry translated labels;
+    // rebuild them when the user switches locale.
+    let navDisposer = null
+    let paletteDisposer = null
+    const registerStatic = () => {
+      if (navDisposer) navDisposer()
+      if (paletteDisposer) paletteDisposer()
+      navDisposer = ctx.register({
+        id: 'nav',
+        area: SIDEBAR_NAV_AREA,
+        data: { path: PAGE_PATH, label: ctx.i18n.t('nav.bancos'), codicon: 'database' },
+      })
+      paletteDisposer = ctx.register({
         id: 'open',
         area: PALETTE_AREA,
         data: {
           id: 'databases.open',
-          label: 'Abrir Bancos',
-          keywords: ['bancos', 'database', 'sql', 'consultas', 'redis'],
+          label: ctx.i18n.t('palette.abrir'),
+          keywords: ['bancos', 'databases', 'sql', 'consultas', 'queries', 'redis'],
           run: () => host.navigate(PAGE_PATH),
         },
-      },
+      })
+    }
+    registerStatic()
+    ctx.i18n?.onLocaleChange?.(registerStatic)
+    ctx.registerMany([
+      { id: 'page', area: ROUTES_AREA, data: { path: PAGE_PATH }, render: () => jsx(ActivityPage, {}) },
+      { id: 'chip', area: STATUSBAR_AREAS.right, order: 120, render: () => jsx(StatusChip, {}) },
     ])
     ctx.registerSettingsPage?.({
       id: 'connections',
-      title: 'Conexões',
+      title: ctx.i18n.t('list.title'),
       icon: 'database',
       render: () => jsx(ConnectionsManager, {}),
-      children: [{ id: 'drivers', title: 'Drivers', render: () => jsx(DriversPage, {}) }],
+      children: [{ id: 'drivers', title: ctx.i18n.t('drivers.title'), render: () => jsx(DriversPage, {}) }],
     })
   },
 }

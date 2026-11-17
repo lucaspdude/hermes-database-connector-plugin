@@ -1,5 +1,6 @@
-// @hermes/plugin-sdk stub: records queries/invalidations/navigations and
-// renders kit components as tagged nodes so tests can walk the tree.
+// @hermes/plugin-sdk stub: records queries/invalidations/navigations, renders
+// kit components as tagged nodes and resolves plugin i18n bundles like the
+// app's plugin-i18n (active locale → en → raw key).
 const component = (name) => (props) => ({ sdk: name, props: props ?? {} })
 
 export const Badge = component('Badge')
@@ -62,3 +63,40 @@ export const pluginSettingsHref = (id, page) =>
   '/settings?tab=plugins&plugin=' + id + '&ppage=' + page
 
 export const relativeTime = () => 'agora'
+
+// ---- plugin i18n (mirrors src/i18n/plugin-i18n.ts resolution) ----
+
+const i18nRegistry = new Map() // plugin id → { locale → messages }
+export let activeLocale = 'en'
+export function setStubLocale(locale) {
+  activeLocale = locale
+}
+
+function resolvePath(messages, key) {
+  let node = messages
+  for (const part of key.split('.')) {
+    if (node === null || typeof node !== 'object') return undefined
+    node = node[part]
+  }
+  return node
+}
+
+function translatePlugin(pluginId, key, args) {
+  const byLocale = i18nRegistry.get(pluginId)
+  for (const locale of [activeLocale, 'en']) {
+    const value = byLocale && resolvePath(byLocale[locale], key)
+    if (value !== undefined) {
+      return typeof value === 'function' ? value(...args) : String(value)
+    }
+  }
+  return key
+}
+
+export function usePluginI18n(pluginId) {
+  return (key, ...args) => translatePlugin(pluginId, key, args)
+}
+
+export function registerStubLocales(pluginId, bundles) {
+  const prev = i18nRegistry.get(pluginId) ?? {}
+  i18nRegistry.set(pluginId, { ...prev, ...bundles })
+}
