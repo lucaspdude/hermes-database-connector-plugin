@@ -90,6 +90,26 @@ E no Redis — `db_redis_command` com `{ "connection_id": "cache-redis",
 "command": "HGETALL", "args": ["pedido:10"] }` → `{ "ok": true, "value": {...},
 "duration_ms": 3 }`.
 
+## Drivers ausentes — como instalar num host (via `driver_missing` ou `/health`)
+
+Quando uma tool responde `{ "ok": false, "code": "driver_missing", "install": "..." }` (ou o
+usuário relata engine indisponível na tela Drivers), o driver daquela engine não está instalado
+no ambiente do gateway. Para resolver você mesmo (precisa de shell no host onde o gateway roda):
+
+1. **Descubra o que falta e o comando exato:** `GET /api/plugins/database-connector/health`
+   devolve, por engine, `{ "available": false, "module": "pymssql", "install": "<comando>" }`.
+   Use o campo `install` **literalmente** — ele já aponta para o Python do gateway e a faixa de
+   versão correta (ex.: `uv pip install --python <python> pymssql>=2.3,<3`).
+2. **Instale** executando o comando `install` via shell no host (nunca via código do plugin —
+   `pip install` em código de plugin é bloqueado pelo security scan do Hermes).
+3. **Reinicie o gateway** (`hermes gateway restart` ou o serviço equivalente): um processo em
+   execução não importa um driver recém-instalado — sem o restart o `driver_missing` persiste.
+4. **Verifique:** `GET /health` (ou a tela Drivers do Desktop) deve mostrar
+   `available: true` para a engine. Aí sim crie/Use a conexão.
+
+Lembrete: instalou o driver **depois** do plugin? `hermes pm repair` re-sincroniza as deps
+declaradas; o escape `hermes plugins install ... --no-deps` existe para hosts sem rede/wheel.
+
 3. **Interpretar o erro** — se vier `{ "ok": false, "code": "read_only", "error":
 "apenas leitura: a tool aceita uma unica statement SELECT (ou CTE WITH ...
 SELECT) (recebido 'update')" }`, a consulta não foi executada: reescreva. Se

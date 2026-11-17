@@ -27,6 +27,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  SegmentedControl,
   StatusDot,
   Switch,
   host,
@@ -71,10 +72,9 @@ const EN = {
     ariaPrefix: 'Database activity: ',
   },
   engines: { sqlserver: 'SQL Server', postgres: 'PostgreSQL', redis: 'Redis' },
+  tabs: { activity: 'Activity', connections: 'Connections', drivers: 'Drivers' },
   page: {
     title: 'Databases',
-    drivers: 'Drivers',
-    connections: 'Connections',
     sectionConnections: 'Connections (last access)',
     sectionQueries: 'Recent queries',
     refreshHint: 'refreshes every 5 s',
@@ -175,10 +175,9 @@ const PT_BR = {
     ariaPrefix: 'Atividade de bancos: ',
   },
   engines: { sqlserver: 'SQL Server', postgres: 'PostgreSQL', redis: 'Redis' },
+  tabs: { activity: 'Atividade', connections: 'Conexões', drivers: 'Drivers' },
   page: {
     title: 'Bancos',
-    drivers: 'Drivers',
-    connections: 'Conexões',
     sectionConnections: 'Conexões (último acesso)',
     sectionQueries: 'Consultas recentes',
     refreshHint: 'atualiza a cada 5 s',
@@ -293,10 +292,20 @@ const useQueriesList = () =>
   })
 
 const useConnections = () =>
-  useQuery({ queryKey: [...QK, 'connections'], queryFn: () => api('/connections') })
+  useQuery({
+    queryKey: [...QK, 'connections'],
+    queryFn: () => api('/connections'),
+    // Settings reads self-heal: a single failed fetch (gateway briefly down,
+    // plugin freshly mounted) must not stick on an open screen forever.
+    refetchInterval: 15000,
+  })
 
 const useHealth = () =>
-  useQuery({ queryKey: [...QK, 'health'], queryFn: () => api('/health') })
+  useQuery({
+    queryKey: [...QK, 'health'],
+    queryFn: () => api('/health'),
+    refetchInterval: 15000,
+  })
 
 function invalidateAll() {
   queryClient.invalidateQueries({ queryKey: QK })
@@ -485,6 +494,7 @@ function ConnectionStatesCard({ t, connections, queries, activeIds }) {
 
 export function ActivityPage() {
   const t = usePluginI18n(PLUGIN_ID)
+  const [tab, setTab] = useState('activity')
   const statusQ = useStatus()
   const queriesQ = useQueriesList()
   const connsQ = useConnections()
@@ -523,21 +533,21 @@ export function ActivityPage() {
           children: banner,
         })
       : null,
-    jsxs('div', { key: 'header', style: { display: 'flex', alignItems: 'baseline', gap: 12 }, children: [
-      jsx('h2', { key: 'title', style: { margin: '0 0 16px' }, children: t('page.title') }),
-      jsx(Button, {
-        key: 'drivers',
-        variant: 'ghost',
-        onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'drivers')),
-        children: t('page.drivers'),
-      }),
-      jsx(Button, {
-        key: 'conns',
-        variant: 'ghost',
-        onClick: () => host.navigate(pluginSettingsHref(PLUGIN_ID, 'connections')),
-        children: t('page.connections'),
-      }),
-    ] }),
+    jsx('h2', { key: 'title', style: { margin: '0 0 12px' }, children: t('page.title') }),
+    jsx(SegmentedControl, {
+      key: 'tabs',
+      style: { marginBottom: 16 },
+      sizing: 'content',
+      value: tab,
+      onChange: setTab,
+      options: [
+        { id: 'activity', label: t('tabs.activity') },
+        { id: 'connections', label: t('tabs.connections') },
+        { id: 'drivers', label: t('tabs.drivers') },
+      ],
+    }),
+    tab === 'activity'
+      ? jsxs(Fragment, { children: [
     jsx(Section, {
       key: 'connections',
       title: t('page.sectionConnections'),
@@ -587,6 +597,10 @@ export function ActivityPage() {
             description: t('empty.noQueriesDesc'),
           }),
     }),
+        ] })
+      : tab === 'connections'
+        ? jsx(ConnectionsManager, { embedded: true })
+        : jsx(DriversPage, { embedded: true }),
   ] })
 }
 
@@ -1044,9 +1058,10 @@ export function DriversPage({ health }) {
   const engines = health?.engines ?? healthQ.data?.engines
   if (!engines) {
     if (healthQ.isError) {
+      const detail = readError(healthQ.error)
       return jsx(ErrorState, {
         title: t('drivers.healthErrorTitle'),
-        description: t('drivers.healthErrorDesc'),
+        description: t('drivers.healthErrorDesc') + (detail ? '\n' + t('page.errorDetail', truncate(detail, 160)) : ''),
       })
     }
     return jsx('div', { style: mutedStyle, children: t('drivers.loading') })
