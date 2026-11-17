@@ -18,11 +18,14 @@ trace, DSN or secret.
 
 from __future__ import annotations
 
+import importlib
 import sqlite3
 from typing import Any, Callable, Mapping
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import drivers
 import service
@@ -31,6 +34,9 @@ PLUGIN_ID = "database-connector"
 
 #: Log source of everything triggered by the REST layer (spec backend-api).
 SOURCE_UI = "ui"
+
+#: Event emitted after every CRUD operation (task 4.6, spec backend-api).
+EVENT_CONNECTION_CHANGED = "connection.changed"
 
 router = APIRouter()
 
@@ -43,6 +49,7 @@ _store: sqlite3.Connection | None = None
 _store_factory: Callable[[], Any] | None = None
 _driver_registry: drivers.DriverRegistry | None = None
 _secret_resolver: Callable[[str], Any] | None = None
+_connection_change_emitter: Callable[[str, str, Mapping[str, Any]], Any] | None = None
 
 
 def set_store(store: Any | None) -> None:
@@ -83,9 +90,17 @@ def get_store() -> sqlite3.Connection:
 
 
 def configure(ctx: Any) -> sqlite3.Connection:
-    """Wiring for the Hermes host: open the plugin store and remember it."""
+    """Wiring for the Hermes host: open the plugin store and remember it.
+
+    When ``ctx`` exposes ``broadcast_plugin_event`` it becomes the emitter of
+    ``connection.changed`` (task 4.6); otherwise the lazy resolution in
+    :func:`resolve_broadcast` takes over.
+    """
     conn = service.init_store(ctx)
     set_store(conn)
+    candidate = getattr(ctx, "broadcast_plugin_event", None)
+    if callable(candidate):
+        set_connection_change_emitter(candidate)
     return conn
 
 
@@ -109,14 +124,65 @@ def get_secret_resolver() -> Callable[[str], Any] | None:
     return _secret_resolver
 
 
-def _notify_connection_changed(action: str, connection_id: str) -> None:
-    """Stub for the ``connection.changed`` signal (task 4.6, out of this slice).
+def set_connection_change_emitter(
+    emitter: Callable[[str, str, Mapping[str, Any]], Any] | None,
+) -> None:
+    """Inject the ``connection.changed`` emitter (tests use a fake/listener).
 
-    Task 4.6 replaces this body with the real ``broadcast_plugin_event`` call;
-    every CRUD handler already goes through the hook, so that change touches
-    one function only. Deliberately a no-op for now — no event is emitted.
+    The signature is the host's one: ``emitter(plugin_id, event, payload)``,
+    i.e. ``broadcast_plugin_event("database-connector", "connection.changed",
+    {...})``.
     """
+    global _connection_change_emitter
+    _connection_change_emitter = emitter
+
+
+def get_connection_change_emitter() -> Callable[..., Any] | None:
+    return _connection_change_emitter
+
+
+#: Where the host may expose ``broadcast_plugin_event``. Tried in order; the
+#: import is **lazy** (inside the emit) because none of these modules exists
+#: outside a running Hermes — importing at module load would break the plugin.
+BROADCAST_SOURCES: tuple[tuple[str, str], ...] = (
+    ("hermes.gateway.events", "broadcast_plugin_event"),
+    ("hermes.gateway", "broadcast_plugin_event"),
+    ("hermes.events", "broadcast_plugin_event"),
+    ("gateway.events", "broadcast_plugin_event"),
+)
+
+
+def resolve_broadcast() -> Callable[..., Any] | None:
+    """Return the host's ``broadcast_plugin_event``, or ``None`` outside Hermes."""
+    for module_name, attribute in BROADCAST_SOURCES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 - module simply not present in tests
+            continue
+        candidate = getattr(module, attribute, None)
+        if callable(candidate):
+            return candidate
     return None
+
+
+def _notify_connection_changed(action: str, connection_id: str) -> bool:
+    """Emit ``connection.changed`` **after** the operation succeeded.
+
+    Called by every CRUD handler. First the injected emitter (tests/listener),
+    then the real ``broadcast_plugin_event`` resolved lazily from the host.
+    A failure here NEVER propagates: the route response is already decided and
+    the Gateway must not lose a 201 because the bus is down (spec backend-api:
+    "eventos apenas invalidam" — REST remains the source of truth).
+    """
+    payload = {"connection_id": str(connection_id), "action": action}
+    try:
+        emitter = get_connection_change_emitter() or resolve_broadcast()
+        if emitter is None:
+            return False
+        emitter(PLUGIN_ID, EVENT_CONNECTION_CHANGED, payload)
+        return True
+    except Exception:  # noqa: BLE001 - emissao falha nao derruba a resposta
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -152,7 +218,19 @@ def _run(operation: Callable[[], Any]) -> Any:
     except service.ValidationError as exc:
         return _error_response(400, "invalid_connection", str(exc))
     except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI
-        return _error_response(400, "invalid_request", f"requisicao invalida: {_clean(exc)}")
+        return _unexpected(exc)
+
+
+def _unexpected(exc: BaseException) -> JSONResponse:
+    """500 clean: no traceback and no exception **message** (it could carry a
+    DSN or a secret value). Only the exception type is exposed, which helps the
+    operator without leaking data (spec backend-api, task 4.7)."""
+    return _error_response(
+        500,
+        "internal_error",
+        "erro interno no plugin database-connector "
+        f"({type(exc).__name__}); consulte os logs do gateway",
+    )
 
 
 def _as_payload(body: Any) -> dict[str, Any]:
@@ -338,3 +416,74 @@ def get_status(session_id: str | None = None, limit: int = 100) -> Any:
 @router.get("/ping")
 def ping() -> Any:
     return {"ok": True, "plugin": PLUGIN_ID}
+
+
+# --------------------------------------------------------------------------
+# 4.5 health de drivers por engine (sem importar nada: so find_spec)
+# --------------------------------------------------------------------------
+
+
+@router.get("/health")
+def health() -> Any:
+    """``GET /health`` — ``{ ok, engines }`` with per-engine driver availability.
+
+    The registry decides availability with ``importlib.util.find_spec`` only, so
+    a missing driver never breaks the other engines nor the plugin load; each
+    entry carries the ready-to-run ``install`` command (uv path resolved).
+    """
+
+    def operation() -> Any:
+        return {"ok": True, "engines": get_driver_registry().health()}
+
+    return _run(operation)
+
+
+# --------------------------------------------------------------------------
+# 4.7 handlers: toda saida de erro vira { error, detail }, sem traceback
+# --------------------------------------------------------------------------
+
+
+def _validation_detail(exc: RequestValidationError) -> str:
+    """Render FastAPI's validation errors as one actionable Portuguese line.
+
+    Only field + message are used — never ``input`` (Pydantic echoes the value
+    there, and that value may be a secret or a full DSN).
+    """
+    parts: list[str] = []
+    for error in exc.errors()[:5]:
+        location = ".".join(
+            str(part) for part in error.get("loc", ()) if part not in {"query", "body", "path"}
+        )
+        message = str(error.get("msg") or "valor invalido")
+        parts.append(f"{location or 'corpo'}: {message}")
+    return "requisicao invalida: " + "; ".join(parts)
+
+
+def _validation_error_handler(_request: Any, exc: RequestValidationError) -> JSONResponse:
+    return _error_response(400, "invalid_request", _validation_detail(exc))
+
+
+def _http_error_handler(_request: Any, exc: StarletteHTTPException) -> JSONResponse:
+    code = {404: "not_found", 405: "method_not_allowed"}.get(
+        exc.status_code, "http_error"
+    )
+    detail = str(exc.detail) if exc.detail else "requisicao nao atendida"
+    return _error_response(exc.status_code, code, detail)
+
+
+def _unexpected_error_handler(_request: Any, exc: Exception) -> JSONResponse:
+    return _unexpected(exc)
+
+
+def install_error_handlers(app: FastAPI) -> FastAPI:
+    """Standardise every out-of-routine failure as ``{error, detail}``.
+
+    An ``APIRouter`` cannot carry exception handlers (they belong to the app),
+    so the host — or the test app — calls this once when mounting the router.
+    Covers: query/body validation (400), unknown paths and methods (404/405)
+    and any unexpected exception (500, no traceback).
+    """
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)
+    app.add_exception_handler(StarletteHTTPException, _http_error_handler)
+    app.add_exception_handler(Exception, _unexpected_error_handler)
+    return app

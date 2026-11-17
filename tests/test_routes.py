@@ -119,6 +119,7 @@ def client(tmp_path):
     plugin_api.set_driver_registry(_registry())
 
     app = FastAPI()
+    plugin_api.install_error_handlers(app)  # 4.7: 4xx/5xx sempre {error, detail}
     app.include_router(plugin_api.router, prefix=PREFIX)
     test_client = TestClient(app)
     yield test_client, conn
@@ -126,6 +127,7 @@ def client(tmp_path):
     plugin_api.set_store(None)
     plugin_api.set_secret_resolver(None)
     plugin_api.set_driver_registry(None)
+    plugin_api.set_connection_change_emitter(None)
     conn.close()
 
 
@@ -500,3 +502,217 @@ def test_status_route_never_leaks_a_secret(client):
 
     assert SECRET_VALUE not in response.text
     assert json.dumps(response.json(), ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# 4.6 evento connection.changed (emissao real: broadcast_plugin_event do host)
+# --------------------------------------------------------------------------
+
+
+class _Emitter:
+    """Listener injetado: grava (plugin_id, event, payload) e o estado do store."""
+
+    def __init__(self, conn=None, raises=None):
+        self.conn = conn
+        self.raises = raises
+        self.events: list[tuple[str, str, dict]] = []
+
+    def __call__(self, plugin_id, event, payload):
+        self.events.append((plugin_id, event, dict(payload)))
+        if self.raises:
+            raise self.raises
+
+
+def test_crud_emits_connection_changed_with_id_and_action(client):
+    test_client, conn = client
+    emitter = _Emitter(conn)
+    plugin_api.set_connection_change_emitter(emitter)
+
+    created = test_client.post(f"{PREFIX}/connections", json=_connection())
+    updated = test_client.put(
+        f"{PREFIX}/connections/prod-sqlserver", json=_connection(label="Prod SQL")
+    )
+    deleted = test_client.delete(f"{PREFIX}/connections/prod-sqlserver")
+
+    assert created.status_code == 201 and updated.status_code == 200
+    assert deleted.status_code == 200
+    assert emitter.events == [
+        ("database-connector", "connection.changed",
+         {"connection_id": "prod-sqlserver", "action": "created"}),
+        ("database-connector", "connection.changed",
+         {"connection_id": "prod-sqlserver", "action": "updated"}),
+        ("database-connector", "connection.changed",
+         {"connection_id": "prod-sqlserver", "action": "deleted"}),
+    ]
+
+
+def test_connection_changed_is_emitted_only_after_the_operation_succeeded(client):
+    """created ve a conexao persistida; conflito (409) nao emite nada."""
+    test_client, conn = client
+    seen_after_create: list[bool] = []
+
+    class Recorder(_Emitter):
+        def __call__(self, plugin_id, event, payload):
+            seen_after_create.append(service.get_connection(conn, payload["connection_id"]) is not None)
+            return super().__call__(plugin_id, event, payload)
+
+    plugin_api.set_connection_change_emitter(Recorder(conn))
+
+    assert test_client.post(f"{PREFIX}/connections", json=_connection()).status_code == 201
+    conflict = test_client.post(f"{PREFIX}/connections", json=_connection(label="Outra"))
+
+    assert conflict.status_code == 409
+    assert seen_after_create == [True]  # emitido depois do sucesso
+    plugin_api.get_connection_change_emitter()
+    assert len(plugin_api.get_connection_change_emitter().events) == 1  # so o create
+
+
+def test_failing_emitter_never_breaks_the_crud_response(client):
+    """Emissao fora do ar nao pode derrubar 201/200 - REST e a fonte de verdade."""
+    test_client, conn = client
+    plugin_api.set_connection_change_emitter(
+        _Emitter(conn, raises=RuntimeError("broadcast fora do ar"))
+    )
+
+    created = test_client.post(f"{PREFIX}/connections", json=_connection())
+    updated = test_client.put(f"{PREFIX}/connections/prod-sqlserver", json=_connection(label="x"))
+    deleted = test_client.delete(f"{PREFIX}/connections/prod-sqlserver")
+
+    assert created.status_code == 201, created.text
+    assert updated.status_code == 200, updated.text
+    assert deleted.status_code == 200, deleted.text
+    assert "Traceback" not in deleted.text
+    assert service.get_connection(conn, "prod-sqlserver") is None
+
+
+def test_emitter_is_resolved_lazily_from_the_host_module(client, monkeypatch):
+    """Sem emissor injetado cai no ``broadcast_plugin_event`` do host (lazy)."""
+    import sys
+    import types
+
+    test_client, _ = client
+    seen: list[tuple] = []
+    module_name, attribute = plugin_api.BROADCAST_SOURCES[0]
+    fake_host = types.ModuleType(module_name)
+    setattr(fake_host, attribute, lambda *args: seen.append(args))
+    monkeypatch.setitem(sys.modules, module_name, fake_host)
+
+    response = test_client.post(f"{PREFIX}/connections", json=_connection())
+
+    assert response.status_code == 201, response.text
+    assert seen == [
+        (
+            "database-connector",
+            "connection.changed",
+            {"connection_id": "prod-sqlserver", "action": "created"},
+        )
+    ]
+
+
+# --------------------------------------------------------------------------
+# 4.7 erros: { error, detail } em texto claro, sem traceback/DSN/segredo
+# --------------------------------------------------------------------------
+
+
+def test_invalid_body_returns_error_and_detail_on_every_write_route(client):
+    test_client, conn = client
+    assert test_client.post(f"{PREFIX}/connections", json=_connection()).status_code == 201
+
+    bad_bodies = [
+        ("post", f"{PREFIX}/connections", {"json": ["nao-e-objeto"]}),
+        ("post", f"{PREFIX}/connections", {"json": "texto"}),
+        ("post", f"{PREFIX}/connections", {"json": {"engine": "oracle", "id": "x"}}),
+        ("put", f"{PREFIX}/connections/prod-sqlserver", {"json": ["nao-e-objeto"]}),
+        ("put", f"{PREFIX}/connections/prod-sqlserver", {"json": "texto"}),
+    ]
+
+    for method, url, kwargs in bad_bodies:
+        response = getattr(test_client, method)(url, **kwargs)
+        assert response.status_code // 100 == 4, (url, response.text)
+        body = response.json()
+        assert set(body) == {"error", "detail"}, (url, body)
+        assert isinstance(body["detail"], str) and body["detail"]
+        assert "Traceback" not in response.text
+        assert SECRET_VALUE not in response.text
+
+
+def test_unknown_connection_returns_404_with_error_and_detail(client):
+    test_client, _ = client
+
+    deleted = test_client.delete(f"{PREFIX}/connections/nao-existe")
+    tested = test_client.post(f"{PREFIX}/connections/nao-existe/test")
+
+    for response in (deleted, tested):
+        assert response.status_code == 404, response.text
+        body = response.json()
+        assert set(body) == {"error", "detail"}
+        assert body["error"] == "connection_not_found"
+        assert "nao existe" in body["detail"]
+        assert "Traceback" not in response.text
+
+
+def test_put_on_unknown_id_upserts_and_the_row_shows_up_in_the_list(client):
+    """Contrato aceito em 4.1/spec: PUT e update **e** upsert (nao da 404)."""
+    test_client, _ = client
+
+    response = test_client.put(
+        f"{PREFIX}/connections/cache-local",
+        json=_connection(id="ignorado", engine="redis", host="cache.local", port=6379),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["connection"]["id"] == "cache-local"
+    listed = test_client.get(f"{PREFIX}/connections").json()["connections"]
+    assert [row["id"] for row in listed] == ["cache-local"]
+
+
+def test_unexpected_failure_inside_a_route_becomes_500_without_traceback(client, monkeypatch):
+    test_client, _ = client
+
+    def boom(_conn):
+        raise RuntimeError(f"disco cheio: dsn=postgres://u:{SECRET_VALUE}@h/db")
+
+    monkeypatch.setattr(service, "list_connections", boom)
+
+    response = test_client.get(f"{PREFIX}/connections")
+
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert set(body) == {"error", "detail"} and body["error"] == "internal_error"
+    assert "RuntimeError" in body["detail"]  # acionavel para quem opera
+    assert "Traceback" not in response.text
+    assert SECRET_VALUE not in response.text and "postgres://" not in response.text
+
+
+def test_app_error_handler_covers_routes_outside_the_router():
+    """Handler generico do app: qualquer excecao vira 500 {error, detail}."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient as _TestClient
+
+    app = FastAPI()
+    plugin_api.install_error_handlers(app)
+
+    @app.get("/fora-do-router")
+    def explode():
+        raise RuntimeError("boom interno")
+
+    response = _TestClient(app, raise_server_exceptions=False).get("/fora-do-router")
+
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert set(body) == {"error", "detail"} and body["error"] == "internal_error"
+    assert "Traceback" not in response.text and "boom" not in response.text
+
+
+def test_query_and_path_errors_also_come_as_error_and_detail(client):
+    test_client, _ = client
+
+    invalid_limit = test_client.get(f"{PREFIX}/queries?limit=abc")
+    unknown_route = test_client.get(f"{PREFIX}/nao-existe")
+
+    for response, expected_status in ((invalid_limit, 400), (unknown_route, 404)):
+        assert response.status_code == expected_status, response.text
+        body = response.json()
+        assert set(body) == {"error", "detail"}, (expected_status, body)
+        assert isinstance(body["detail"], str) and body["detail"]
+        assert "Traceback" not in response.text
