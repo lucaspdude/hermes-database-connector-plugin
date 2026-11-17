@@ -105,6 +105,47 @@ class _FakeRedisDriver:
         return _FakeRedisClient(**kwargs)
 
 
+class OperationalError(Exception):
+    """Stand-in de ``psycopg.OperationalError`` (cliente fechado)."""
+
+
+class _PgLikeClient:
+    """Client estilo psycopg: **depois de fechado** ``.info`` estoura.
+
+    E o bug do P1: a versao era lida fora do ``close``, entao um probe
+    bem-sucedido virava 500 e a linha do log nem chegava a ser gravada.
+    Aqui o ``close`` tambem falha — e isso nao pode mudar o resultado.
+    """
+
+    def __init__(self, version="16.2"):
+        self._version = version
+        self.closed = False
+        self.executed: list[str] = []
+
+    @property
+    def info(self):
+        if self.closed:
+            raise OperationalError("the connection is closed")
+        return _FakeSqlClient(version=self._version)
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def close(self):
+        self.closed = True
+        raise RuntimeError("falha ao fechar o client (ja fechado)")
+
+
+class _FixedClientDriver:
+    """Driver que devolve sempre o mesmo client (para forcar o cenario)."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def connect(self, **_kwargs):
+        return self.client
+
+
 # --------------------------------------------------------------------------
 # fixtures
 # --------------------------------------------------------------------------
@@ -716,3 +757,97 @@ def test_query_and_path_errors_also_come_as_error_and_detail(client):
         assert set(body) == {"error", "detail"}, (expected_status, body)
         assert isinstance(body["detail"], str) and body["detail"]
         assert "Traceback" not in response.text
+
+
+# --------------------------------------------------------------------------
+# correcoes pos-revisao: probe apos close e 4xx/5xx sem handler de app
+# --------------------------------------------------------------------------
+
+
+def test_probe_ok_is_reported_and_logged_when_the_client_is_already_closed(client):
+    """Versao capturada **antes** do close: probe ok responde 200 e loga a linha."""
+    test_client, conn = client
+    connection_id = "prod-pg"
+    assert (
+        test_client.post(f"{PREFIX}/connections", json=_connection(id=connection_id, engine="postgres")).status_code
+        == 201
+    )
+
+    fake_client = _PgLikeClient(version="16.2")
+    plugin_api.set_driver_registry(_registry(postgres=_FixedClientDriver(fake_client)))
+
+    response = test_client.post(f"{PREFIX}/connections/{connection_id}/test")
+
+    assert fake_client.closed is True  # o client foi fechado
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["server_version"] == "16.2"  # lido enquanto aberto
+    assert "Traceback" not in response.text
+
+    rows = service.list_query_log(conn, connection_id=connection_id)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "ui"
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["statement"] is None
+    assert rows[0]["duration_ms"] == body["latency_ms"]
+
+
+def test_every_failure_is_error_and_detail_without_any_app_handler(tmp_path, monkeypatch):
+    """O router se garante sozinho — o host Hermes monta o router, nao um app nosso."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient as _TestClient
+
+    conn = service.open_store(str(tmp_path / "connector.db"))
+    plugin_api.set_store(conn)
+    try:
+        app = FastAPI()  # SEM install_error_handlers: so o router do plugin
+        app.include_router(plugin_api.router, prefix=PREFIX)
+        test_client = _TestClient(app)  # excecao escapada viraria erro do teste
+
+        cases = [
+            (test_client.get(f"{PREFIX}/nao-existe"), 404),
+            (test_client.delete(f"{PREFIX}/ping"), 405),
+            (test_client.get(f"{PREFIX}/queries?limit=abc"), 400),
+            (test_client.get(f"{PREFIX}/status?limit=0"), 400),
+            # JSON malformado: antes virava o 422 do framework (ecoando input)
+            (
+                test_client.post(
+                    f"{PREFIX}/connections",
+                    content=b"{nao-e-json",
+                    headers={"content-type": "application/json"},
+                ),
+                400,
+            ),
+            (
+                test_client.put(
+                    f"{PREFIX}/connections/x",
+                    content=b"[",
+                    headers={"content-type": "application/json"},
+                ),
+                400,
+            ),
+        ]
+        for response, expected_status in cases:
+            assert response.status_code == expected_status, (expected_status, response.text)
+            body = response.json()
+            assert set(body) == {"error", "detail"}, (expected_status, body)
+            assert isinstance(body["detail"], str) and body["detail"]
+            assert "Traceback" not in response.text
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError(f"disco cheio: dsn=postgres://u:{SECRET_VALUE}@h/db")
+
+        monkeypatch.setattr(service, "status_snapshot", boom)
+
+        response = test_client.get(f"{PREFIX}/status")
+
+        assert response.status_code == 500, response.text
+        body = response.json()
+        assert set(body) == {"error", "detail"} and body["error"] == "internal_error"
+        assert "RuntimeError" in body["detail"]  # acionavel, sem vazar a causa
+        assert "Traceback" not in response.text
+        assert SECRET_VALUE not in response.text and "postgres://" not in response.text
+    finally:
+        plugin_api.set_store(None)
+        conn.close()

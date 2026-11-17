@@ -14,11 +14,14 @@ the value in memory, at runtime, and reports only its state.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping
 
@@ -26,6 +29,10 @@ from drivers import DriverMissingError, DriverRegistry, spec_for
 
 PLUGIN_ID = "database-connector"
 DB_FILENAME = "connector.db"
+
+#: Everything the store accepts: an open connection (tests, ``plugin_db``) or a
+#: db path, from which each call opens its own connection (see :func:`write_tx`).
+Store = sqlite3.Connection | str | os.PathLike[str]
 
 #: Accepted enums (spec ``connection-store`` -> "CRUD de conexões validado").
 ENGINES = ("sqlserver", "postgres", "redis")
@@ -122,7 +129,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def connect(db_path: str | sqlite3.Connection) -> sqlite3.Connection:
+def connect(db_path: str | os.PathLike[str] | sqlite3.Connection) -> sqlite3.Connection:
     """Return a ready-to-use connection (accepts a path or an open one).
 
     Pragmas follow the design decision 2: WAL, ``foreign_keys=True`` (so
@@ -132,15 +139,83 @@ def connect(db_path: str | sqlite3.Connection) -> sqlite3.Connection:
     if isinstance(db_path, sqlite3.Connection):
         conn = db_path
     else:
-        # ``check_same_thread=False``: the same store is used by the gateway's
-        # event loop (REST) and, later, by the agent tools' thread. Every use
-        # here is a short transaction, so there is no overlapping cursor.
+        # ``check_same_thread=False``: an injected store may be handed to a
+        # different thread than the one that opened it. Individual statements
+        # still never overlap — see :func:`write_tx` / :func:`read_conn`.
         conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def database_path(conn: sqlite3.Connection) -> str | None:
+    """Path of the ``main`` database of ``conn``; ``None`` when it is in-memory."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:  # noqa: BLE001 - closed/invalid connection: no path to reuse
+        return None
+    for row in rows:
+        name, path = row[1], row[2]
+        if name == "main":
+            return str(path) if path else None
+    return None
+
+
+#: Serialises the fallback below (a store that cannot be re-opened by path,
+#: e.g. ``":memory:"``): one shared object must never be used by two threads.
+_shared_store_lock = threading.RLock()
+
+
+def _private_connection(store: Store) -> sqlite3.Connection | None:
+    """A connection **of its own** for this call, or ``None`` when impossible.
+
+    Root of the concurrent-write guarantee (spec ``connection-store`` ->
+    "Escritas concorrentes"): re-opening the *same* db path gives every call a
+    fresh connection, so no Python-level cursor/transaction state is ever
+    shared between the REST threadpool threads — WAL + ``busy_timeout`` then do
+    what they are actually for (making one writer wait for the other, across
+    connections and processes). Returns ``None`` only for in-memory stores,
+    which cannot be reached from another thread.
+    """
+    if isinstance(store, (str, os.PathLike)):
+        return connect(str(store))
+    path = database_path(store)
+    return connect(path) if path else None
+
+
+@contextmanager
+def write_tx(store: Store) -> Iterator[sqlite3.Connection]:
+    """Yield a connection for **one short write transaction**, serialised. """
+    private = _private_connection(store)
+    if private is not None:
+        try:
+            migrate(private)  # idempotent: no-op once the schema is current
+            with private:  # curta: BEGIN/COMMIT em volta de um unico statement
+                yield private
+        finally:
+            private.close()
+        return
+    if not isinstance(store, sqlite3.Connection):  # pragma: no cover - wiring bug
+        raise TypeError("store must be a sqlite3.Connection or a db path")
+    with _shared_store_lock:
+        with store:
+            yield store
+
+
+@contextmanager
+def read_conn(store: Store) -> Iterator[sqlite3.Connection]:
+    """Yield a connection for reads, private to this call when possible."""
+    private = _private_connection(store)
+    if private is not None:
+        try:
+            yield private
+        finally:
+            private.close()
+        return
+    with _shared_store_lock:
+        yield store
 
 
 def schema_version(conn: sqlite3.Connection) -> int:
@@ -254,7 +329,7 @@ def _row_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def upsert_connection(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict[str, Any]:
+def upsert_connection(store: Store, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Insert or update a connection by ``id`` (upsert).
 
     Validation happens before any write, so an invalid payload never leaves a
@@ -271,28 +346,30 @@ def upsert_connection(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> d
         if column not in ("id", "created_at")
     )
 
-    with conn:
+    with write_tx(store) as conn:
         conn.execute(
             f"INSERT INTO connections ({columns}) VALUES ({placeholders}) "
             f"ON CONFLICT(id) DO UPDATE SET {updates}",
             row,
         )
-    return get_connection(conn, row["id"]) or row
+    return get_connection(store, row["id"]) or row
 
 
-def get_connection(conn: sqlite3.Connection, connection_id: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM connections WHERE id = ?", (connection_id,)).fetchone()
+def get_connection(store: Store, connection_id: str) -> dict[str, Any] | None:
+    with read_conn(store) as conn:
+        row = conn.execute("SELECT * FROM connections WHERE id = ?", (connection_id,)).fetchone()
     return dict(row) if row else None
 
 
-def list_connections(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute("SELECT * FROM connections ORDER BY id").fetchall()
+def list_connections(store: Store) -> list[dict[str, Any]]:
+    with read_conn(store) as conn:
+        rows = conn.execute("SELECT * FROM connections ORDER BY id").fetchall()
     return [dict(row) for row in rows]
 
 
-def delete_connection(conn: sqlite3.Connection, connection_id: str) -> bool:
+def delete_connection(store: Store, connection_id: str) -> bool:
     """Delete a connection; ``query_log`` rows follow via ``ON DELETE CASCADE``."""
-    with conn:
+    with write_tx(store) as conn:
         cursor = conn.execute("DELETE FROM connections WHERE id = ?", (connection_id,))
     return cursor.rowcount > 0
 
@@ -408,7 +485,7 @@ def new_query_id() -> str:
 
 
 def start_query_log(
-    conn: sqlite3.Connection,
+    store: Store,
     *,
     connection_id: str,
     engine: str,
@@ -422,7 +499,7 @@ def start_query_log(
 ) -> str:
     """Insert a ``running`` row (query.started) and prune the log."""
     query_id = query_id or new_query_id()
-    with conn:
+    with write_tx(store) as conn:
         conn.execute(
             "INSERT INTO query_log (ts, query_id, connection_id, engine, environment, "
             "statement, rows, duration_ms, status, error, source, session_id, "
@@ -445,7 +522,7 @@ def start_query_log(
 
 
 def finish_query_log(
-    conn: sqlite3.Connection,
+    store: Store,
     query_id: str,
     *,
     status: str = "ok",
@@ -460,7 +537,7 @@ def finish_query_log(
     message = None
     if error is not None:
         message = str(error)[:ERROR_MAX_CHARS]
-    with conn:
+    with write_tx(store) as conn:
         cursor = conn.execute(
             "UPDATE query_log SET status = ?, rows = ?, duration_ms = ?, error = ? "
             "WHERE query_id = ?",
@@ -470,7 +547,7 @@ def finish_query_log(
 
 
 def append_query_log(
-    conn: sqlite3.Connection,
+    store: Store,
     *,
     connection_id: str,
     engine: str,
@@ -489,7 +566,7 @@ def append_query_log(
     """Append a final log row in one write, pruning beyond the cap with it."""
     query_id = query_id or new_query_id()
     message = str(error)[:ERROR_MAX_CHARS] if error is not None else None
-    with conn:
+    with write_tx(store) as conn:
         conn.execute(
             "INSERT INTO query_log (ts, query_id, connection_id, engine, environment, "
             "statement, rows, duration_ms, status, error, source, session_id, "
@@ -515,7 +592,7 @@ def append_query_log(
 
 
 def list_query_log(
-    conn: sqlite3.Connection,
+    store: Store,
     *,
     limit: int = 100,
     connection_id: str | None = None,
@@ -539,21 +616,24 @@ def list_query_log(
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY ts DESC, id DESC LIMIT ?"
     params.append(int(limit))
-    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    with read_conn(store) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def count_query_log(conn: sqlite3.Connection) -> int:
-    return int(conn.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
+def count_query_log(store: Store) -> int:
+    with read_conn(store) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
 
 
-def last_query_log_id(conn: sqlite3.Connection) -> int:
+def last_query_log_id(store: Store) -> int:
     """Highest ``query_log.id`` — the sequence used for reconciliation."""
-    row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM query_log").fetchone()
+    with read_conn(store) as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM query_log").fetchone()
     return int(row[0]) if row else 0
 
 
 def list_active_queries(
-    conn: sqlite3.Connection,
+    store: Store,
     *,
     session_id: str | None = None,
     limit: int = 100,
@@ -566,13 +646,16 @@ def list_active_queries(
         params.append(session_id)
     sql += " ORDER BY ts DESC, id DESC LIMIT ?"
     params.append(int(limit))
-    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    with read_conn(store) as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def query_log_counters(conn: sqlite3.Connection) -> dict[str, int]:
+def query_log_counters(store: Store) -> dict[str, int]:
     """Row counts per status — the ``counters`` block of ``GET /status``."""
     counters = {"running": 0, "ok": 0, "error": 0}
-    for row in conn.execute("SELECT status, COUNT(*) FROM query_log GROUP BY status"):
+    with read_conn(store) as conn:
+        rows = conn.execute("SELECT status, COUNT(*) FROM query_log GROUP BY status").fetchall()
+    for row in rows:
         key = str(row[0]) if row[0] in counters else None
         if key:
             counters[key] = int(row[1])
@@ -580,12 +663,13 @@ def query_log_counters(conn: sqlite3.Connection) -> dict[str, int]:
     return counters
 
 
-def count_connections(conn: sqlite3.Connection) -> int:
-    return int(conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0])
+def count_connections(store: Store) -> int:
+    with read_conn(store) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0])
 
 
 def status_snapshot(
-    conn: sqlite3.Connection,
+    store: Store,
     *,
     session_id: str | None = None,
     limit: int = 100,
@@ -596,10 +680,10 @@ def status_snapshot(
     re-reading this endpoint (it never trusts the event payload).
     """
     return {
-        "active": list_active_queries(conn, session_id=session_id, limit=limit),
-        "connections": count_connections(conn),
-        "last_seq": last_query_log_id(conn),
-        "counters": query_log_counters(conn),
+        "active": list_active_queries(store, session_id=session_id, limit=limit),
+        "connections": count_connections(store),
+        "last_seq": last_query_log_id(store),
+        "counters": query_log_counters(store),
     }
 
 
@@ -736,9 +820,18 @@ def _close_quietly(obj: Any) -> None:
 
 
 def _server_version(client: Any) -> str | None:
-    """Best-effort server version, read from the driver without extra probes."""
-    for holder in (getattr(client, "info", None), client):
-        value = getattr(holder, "server_version", None) if holder is not None else None
+    """Best-effort server version, read from the driver without extra probes.
+
+    Every attribute read is protected: a driver may raise for a client it
+    considers closed (psycopg raises ``OperationalError`` from ``.info``), and
+    that must never turn a successful probe into a 500.
+    """
+    for holder_name in ("info", None):
+        try:
+            holder = client if holder_name is None else getattr(client, holder_name)
+            value = getattr(holder, "server_version", None) if holder is not None else None
+        except Exception:  # noqa: BLE001 - closed/blocked client: report nothing
+            continue
         if isinstance(value, (str, int, float)) and value:
             return str(value)
     return None
@@ -885,24 +978,37 @@ def test_connection(connection: Mapping[str, Any], registry: DriverRegistry | No
                         started=started, engine=engine)
 
     # Fase 2: sonda mínima (budget = statement_timeout_s)
-    def probe() -> None:
+    def probe() -> dict[str, Any]:
+        """Probe and collect everything useful **while the client is open**.
+
+        The version is read here, never after ``close``: several drivers
+        (psycopg among them) raise once the client is closed, and that failure
+        used to turn a successful test into a 500 — before the log line was
+        even written.
+        """
+        outcome: dict[str, Any] = {}
         try:
             if spec.probe == "ping":
                 client.ping()
-                return
-            cursor = client.cursor()
-            try:
-                cursor.execute(PROBE_STATEMENTS[engine])
+            else:
+                cursor = client.cursor()
                 try:
-                    cursor.fetchone()
-                except Exception:  # noqa: BLE001 - some drivers have no row
-                    pass
-            finally:
-                _close_quietly(cursor)
+                    cursor.execute(PROBE_STATEMENTS[engine])
+                    try:
+                        cursor.fetchone()
+                    except Exception:  # noqa: BLE001 - some drivers have no row
+                        pass
+                finally:
+                    _close_quietly(cursor)
+            version = _server_version(client)  # ainda aberto (e tolerante a falha)
+            if version:
+                outcome["server_version"] = version
         finally:
+            # fechar nunca invalida o resultado ja capturado acima
             _close_quietly(client)
+        return outcome
 
-    _, exc = _run_with_deadline(statement_timeout_s, probe)
+    info, exc = _run_with_deadline(statement_timeout_s, probe)
     if exc is not None:
         _close_quietly(client)
         if isinstance(exc, TimeoutError):
@@ -920,7 +1026,6 @@ def test_connection(connection: Mapping[str, Any], registry: DriverRegistry | No
         "ok": True,
         "latency_ms": int(round((time.perf_counter() - started) * 1000)),
     }
-    version = _server_version(client)
-    if version:
-        payload["server_version"] = version
+    if isinstance(info, Mapping) and info.get("server_version"):
+        payload["server_version"] = str(info["server_version"])
     return payload

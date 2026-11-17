@@ -19,10 +19,11 @@ trace, DSN or secret.
 from __future__ import annotations
 
 import importlib
+import json
 import sqlite3
 from typing import Any, Callable, Mapping
 
-from fastapi import APIRouter, Body, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -31,6 +32,30 @@ import drivers
 import service
 
 PLUGIN_ID = "database-connector"
+
+
+async def _read_body(request: Request) -> bytes:
+    """Raw body as a dependency: the framework parses nothing.
+
+    A router cannot own a ``RequestValidationError`` handler, and letting
+    FastAPI parse the body answers a malformed JSON with its own 422 (echoing
+    ``input``). Reading it here and decoding it inside ``_run`` keeps every
+    failure in the plugin's ``{error, detail}`` path — and the raw payload is
+    never echoed back.
+    """
+    return await request.body()
+
+
+def _decode_body(raw: bytes) -> Any:
+    """Decode the JSON body inside ``_run`` (never echo it in the error)."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise _HttpError(
+            400, "invalid_body", "corpo invalido: o JSON enviado nao pode ser lido"
+        ) from None
 
 #: Log source of everything triggered by the REST layer (spec backend-api).
 SOURCE_UI = "ui"
@@ -266,12 +291,12 @@ def list_connections() -> Any:
 
 
 @router.post("/connections")
-def create_connection(payload: Any = Body(None)) -> Any:
+def create_connection(raw: bytes = Depends(_read_body)) -> Any:
     """``POST /connections`` — 201 on create, 409 when the ``id`` exists."""
 
     def operation() -> Any:
         conn = get_store()
-        body = _as_payload(payload)
+        body = _as_payload(_decode_body(raw))
         connection_id = str(body.get("id") or "").strip()
         if service.get_connection(conn, connection_id):
             raise _HttpError(
@@ -290,12 +315,14 @@ def create_connection(payload: Any = Body(None)) -> Any:
 
 
 @router.put("/connections/{connection_id}")
-def upsert_connection_route(connection_id: str, payload: Any = Body(None)) -> Any:
+def upsert_connection_route(
+    connection_id: str, raw: bytes = Depends(_read_body)
+) -> Any:
     """``PUT /connections/{id}`` — update/upsert; the path ``id`` always wins."""
 
     def operation() -> Any:
         conn = get_store()
-        body = _as_payload(payload)
+        body = _as_payload(_decode_body(raw))
         body["id"] = connection_id
         row = service.upsert_connection(conn, body)
         _notify_connection_changed("updated", row["id"])
@@ -370,19 +397,39 @@ def test_connection_route(connection_id: str) -> Any:
 # --------------------------------------------------------------------------
 
 
+def _parse_int(field: str, raw: str | None, *, minimum: int, default: int) -> int:
+    """Parse a query parameter **inside the route** (never let the framework
+    raise for us): an ``APIRouter`` cannot own exception handlers, so anything
+    the framework validates would escape the ``{error, detail}`` contract."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        parsed = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise _HttpError(
+            400, "invalid_request", f"requisicao invalida: {field}: esperado inteiro >= {minimum}"
+        ) from None
+    if parsed < minimum:
+        raise _HttpError(
+            400, "invalid_request", f"requisicao invalida: {field}: esperado inteiro >= {minimum}"
+        )
+    return parsed
+
+
 @router.get("/queries")
 def list_queries(
-    limit: int = 100,
+    limit: str | None = Query(None),
     connection_id: str | None = None,
-    since_id: int | None = None,
+    since_id: str | None = Query(None),
 ) -> Any:
     """``GET /queries`` — newest first, ``{ queries: [...] }``."""
 
     def operation() -> Any:
-        if limit < 1:
-            raise _HttpError(400, "invalid_limit", "invalid limit: esperado inteiro >= 1")
         rows = service.list_query_log(
-            get_store(), limit=limit, connection_id=connection_id, since_id=since_id
+            get_store(),
+            limit=_parse_int("limit", limit, minimum=1, default=100),
+            connection_id=connection_id,
+            since_id=_parse_int("since_id", since_id, minimum=0, default=0) or None,
         )
         return {"ok": True, "queries": rows}
 
@@ -395,12 +442,16 @@ def list_queries(
 
 
 @router.get("/status")
-def get_status(session_id: str | None = None, limit: int = 100) -> Any:
+def get_status(
+    session_id: str | None = None, limit: str | None = Query(None)
+) -> Any:
     """``GET /status`` — ``{ active, connections, last_seq, counters }``."""
 
     def operation() -> Any:
         snapshot = service.status_snapshot(
-            get_store(), session_id=session_id, limit=limit
+            get_store(),
+            session_id=session_id,
+            limit=_parse_int("limit", limit, minimum=1, default=100),
         )
         snapshot["ok"] = True
         return snapshot
@@ -475,13 +526,80 @@ def _unexpected_error_handler(_request: Any, exc: Exception) -> JSONResponse:
     return _unexpected(exc)
 
 
-def install_error_handlers(app: FastAPI) -> FastAPI:
-    """Standardise every out-of-routine failure as ``{error, detail}``.
+#: Path of the catch-all route below (never counted as a "known" route).
+CATCH_ALL_PATH = "/{unknown_path:path}"
 
-    An ``APIRouter`` cannot carry exception handlers (they belong to the app),
-    so the host — or the test app — calls this once when mounting the router.
-    Covers: query/body validation (400), unknown paths and methods (404/405)
-    and any unexpected exception (500, no traceback).
+#: Methods probed to tell a 404 from a 405 inside the catch-all route.
+_PROBE_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+
+
+def _known_route_segments() -> list[tuple[list[str], list[str]]]:
+    """``(segments, methods)`` of every real route of this router.
+
+    Read from the router itself: the host may mount it under any prefix (and
+    recent FastAPI versions keep included routers lazy), so matching is done on
+    the **tail** of the requested path.
+    """
+    known: list[tuple[list[str], list[str]]] = []
+    for route in router.routes:
+        route_path = getattr(route, "path", None)
+        if not route_path or route_path == CATCH_ALL_PATH:
+            continue
+        segments = route_path.strip("/").split("/") if route_path.strip("/") else []
+        known.append((segments, [m for m in getattr(route, "methods", None) or ()]))
+    return known
+
+
+def _routes_matching(request: Request) -> list[str]:
+    """Methods the router accepts for the requested path (405 vs 404)."""
+    path = request.scope.get("path") or "/"
+    requested = path.strip("/").split("/") if path.strip("/") else []
+    found: list[str] = []
+    for segments, methods in _known_route_segments():
+        if not segments or len(segments) > len(requested):
+            continue
+        tail = requested[-len(segments):]
+        if not all(
+            segment.startswith("{") or segment == got for segment, got in zip(segments, tail)
+        ):
+            continue
+        for method in methods:
+            if method not in found:
+                found.append(method)
+    return found
+
+
+@router.api_route(CATCH_ALL_PATH, methods=list(_PROBE_METHODS), include_in_schema=False)
+def _catch_all(request: Request) -> Any:
+    """Whatever this router does not own still answers ``{error, detail}``.
+
+    Registered **last**, so every real route wins. It is what makes the 4xx
+    contract true in the host (which mounts the router into *its* app and
+    never sees a plugin-level exception handler): unknown paths and wrong
+    methods inside the plugin prefix are answered here, not by the framework.
+    """
+    path = request.scope.get("path") or "/"
+    allowed = _routes_matching(request)
+    if allowed:
+        return _error_response(
+            405,
+            "method_not_allowed",
+            f"metodo {request.method} nao permitido em '{path}'; use {', '.join(allowed)}",
+        )
+    return _error_response(
+        404, "not_found", f"rota desconhecida no plugin database-connector: '{path}'"
+    )
+
+
+def install_error_handlers(app: FastAPI) -> FastAPI:
+    """Extend the ``{error, detail}`` standard to the **app** that mounts us.
+
+    Complement, not the guarantee: an ``APIRouter`` cannot carry exception
+    handlers (they belong to the app), so every failure inside this plugin is
+    already standardised here — route bodies by ``_run``, query/body values by
+    parsing them inside the route, and unknown paths/methods by the catch-all
+    route above. This helper covers what the host itself raises outside the
+    plugin prefix (its own routes, when it opts in).
     """
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, _http_error_handler)

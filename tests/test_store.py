@@ -242,6 +242,67 @@ def test_query_log_prunes_to_cap_keeping_the_newest(db):
     assert service.count_query_log(db) <= service.QUERY_LOG_CAP
 
 
+# --------------------------------------------------------------------------
+# escritas concorrentes (spec connection-store): REST + tool ao mesmo tempo
+# --------------------------------------------------------------------------
+
+
+def test_concurrent_writes_keep_every_row_and_corrupt_nothing(tmp_path):
+    """8 threads x 50 escritas: 400 linhas, zero erro (nenhuma escrita perdida).
+
+    This is the scenario that used to lose data: every call shares the db
+    *path*, so each writer gets its own connection (``write_tx``) instead of
+    fighting over one ``sqlite3.Connection``.
+    """
+    import threading
+
+    path = str(tmp_path / "connector.db")
+    store = service.open_store(path)
+    service.upsert_connection(store, _connection())
+
+    writers = 8
+    per_writer = 50
+    errors: list[str] = []
+
+    def worker(index: int) -> None:
+        try:
+            for step in range(per_writer):
+                service.append_query_log(
+                    store,  # mesma store injetada pelas rotas: caminho resolvido dela
+                    connection_id="prod-sqlserver",
+                    engine="sqlserver",
+                    environment="prod",
+                    statement=f"SELECT col{index} FROM t{step}",
+                    source="agent" if index % 2 else "ui",
+                    ts=_ts(index * per_writer + step),
+                )
+        except Exception as exc:  # noqa: BLE001 - registrado e assertion abaixo
+            errors.append(f"writer {index}: {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert errors == [], errors
+    assert service.count_query_log(store) == writers * per_writer
+    assert len({row["query_id"] for row in service.list_query_log(store, limit=1000)}) == (
+        writers * per_writer
+    )
+
+    # o arquivo continua integro e legivel por uma conexao independente
+    reopened = sqlite3.connect(path)
+    try:
+        assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert reopened.execute("SELECT COUNT(*) FROM query_log").fetchone()[0] == (
+            writers * per_writer
+        )
+    finally:
+        reopened.close()
+        store.close()
+
+
 def test_start_and_finish_write_a_single_log_line(db):
     service.upsert_connection(db, _connection())
 
