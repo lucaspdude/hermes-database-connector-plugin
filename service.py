@@ -129,7 +129,13 @@ def connect(db_path: str | sqlite3.Connection) -> sqlite3.Connection:
     ``ON DELETE CASCADE`` works) and ``busy_timeout`` so concurrent writers
     wait instead of failing.
     """
-    conn = db_path if isinstance(db_path, sqlite3.Connection) else sqlite3.connect(db_path)
+    if isinstance(db_path, sqlite3.Connection):
+        conn = db_path
+    else:
+        # ``check_same_thread=False``: the same store is used by the gateway's
+        # event loop (REST) and, later, by the agent tools' thread. Every use
+        # here is a short transaction, so there is no overlapping cursor.
+        conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -159,7 +165,7 @@ def migrate(conn: sqlite3.Connection) -> int:
 
 def open_store(db_path: str) -> sqlite3.Connection:
     """Open ``db_path`` (or an in-memory/ existing connection) and migrate it."""
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     migrate(conn)
     return conn
 
@@ -513,13 +519,24 @@ def list_query_log(
     *,
     limit: int = 100,
     connection_id: str | None = None,
+    since_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Newest first; optional filter by connection (read contract for /queries)."""
+    """Newest first; optional filters by connection and by ``id > since_id``.
+
+    ``since_id`` is the cursor the UI uses to reconcile lost events: only rows
+    newer than the last one it saw are returned.
+    """
     sql = "SELECT * FROM query_log"
     params: list[Any] = []
+    clauses: list[str] = []
     if connection_id:
-        sql += " WHERE connection_id = ?"
+        clauses.append("connection_id = ?")
         params.append(connection_id)
+    if since_id is not None:
+        clauses.append("id > ?")
+        params.append(int(since_id))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY ts DESC, id DESC LIMIT ?"
     params.append(int(limit))
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
@@ -527,6 +544,89 @@ def list_query_log(
 
 def count_query_log(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
+
+
+def last_query_log_id(conn: sqlite3.Connection) -> int:
+    """Highest ``query_log.id`` — the sequence used for reconciliation."""
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM query_log").fetchone()
+    return int(row[0]) if row else 0
+
+
+def list_active_queries(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Rows still ``running`` (newest first), optionally narrowed to a session."""
+    sql = "SELECT * FROM query_log WHERE status = 'running'"
+    params: list[Any] = []
+    if session_id:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def query_log_counters(conn: sqlite3.Connection) -> dict[str, int]:
+    """Row counts per status — the ``counters`` block of ``GET /status``."""
+    counters = {"running": 0, "ok": 0, "error": 0}
+    for row in conn.execute("SELECT status, COUNT(*) FROM query_log GROUP BY status"):
+        key = str(row[0]) if row[0] in counters else None
+        if key:
+            counters[key] = int(row[1])
+    counters["total"] = sum(counters[key] for key in ("running", "ok", "error"))
+    return counters
+
+
+def count_connections(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0])
+
+
+def status_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """``{ active, connections, last_seq, counters }`` (spec backend-api).
+
+    Everything is read from the store, so a UI that lost an event converges by
+    re-reading this endpoint (it never trusts the event payload).
+    """
+    return {
+        "active": list_active_queries(conn, session_id=session_id, limit=limit),
+        "connections": count_connections(conn),
+        "last_seq": last_query_log_id(conn),
+        "counters": query_log_counters(conn),
+    }
+
+
+def connection_view(
+    connection_row: Mapping[str, Any],
+    resolver: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """Public view of a connection row: adds ``secret_state``, never the value.
+
+    The row itself only ever carries ``secret_ref``; the state is resolved in
+    memory here. A resolver failure never leaks a traceback — it is reported as
+    ``missing`` with a clean error message.
+    """
+    view = dict(connection_row)
+    try:
+        secret = resolve_secret(connection_row, resolver=resolver)
+    except Exception as exc:  # noqa: BLE001 - HTTP layer must see a clean error
+        secret = {
+            "state": STATE_MISSING,
+            "error": _clean_error(exc),
+        }
+    view["secret_state"] = secret["state"]
+    view.pop("secret_value", None)
+    # defensive: drop anything that could ever hold a resolved value
+    for key in ("password", "secret", "secret_value"):
+        view.pop(key, None)
+    return view
 
 
 # --------------------------------------------------------------------------
