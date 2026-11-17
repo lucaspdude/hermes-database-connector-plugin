@@ -17,5 +17,8 @@ config_schema:
       caracteres, literais mascarados e sem comentário). Desligue para manter
       apenas os metadados (conexão, engine, duração e linhas) no log e nos
       eventos. O erro nunca carrega senha, DSN ou host, ligado ou desligado.
-provides_tools: []
+provides_tools:
+  - db_list_connections
+  - db_query
+  - db_redis_command
 provides_hooks: []

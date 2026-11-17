@@ -9,13 +9,16 @@ MANIFEST = ROOT / "plugin.yaml"
 PREFIX = "/api/plugins/database-connector"
 
 
-def test_manifest_parses_with_empty_provides_tools():
+def test_manifest_parses_with_the_three_provided_tools():
     assert MANIFEST.exists(), "plugin.yaml must live at the repo root"
 
     data = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
 
     assert data["name"] == "database-connector"
-    assert data["provides_tools"] == []
+    # Task 3.5: the manifest mirrors exactly what register_tools registers.
+    import tools
+
+    assert sorted(data["provides_tools"]) == sorted(tools.TOOL_NAMES)
 
 
 def test_ping_route_mounted_on_plugin_prefix():

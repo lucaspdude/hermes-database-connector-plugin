@@ -10,13 +10,18 @@ em ctx do Hermes também** (task 3.1).
 """
 
 import json
+import pathlib
 
 import pytest
+import yaml
 
 import service
 import tools
 from drivers import DriverRegistry
 from drivers import redis as redis_driver
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "plugin.yaml"
 
 
 # --------------------------------------------------------------------------
@@ -296,6 +301,24 @@ def test_register_pluga_store_config_e_registra_as_tres_tools(db, tmp_path):
 
     # config provider do host plugado no service (toggle log_statement)
     assert service.get_config("log_statement", False) is True
+
+
+def test_provides_tools_do_manifesto_bate_com_as_tools_registradas(tmp_path):
+    """Task 3.5: zero divergence between manifest and ``ctx.register_tool``."""
+    manifest = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
+    ctx = _FakeCtx(store_conn=service.open_store(str(tmp_path / "manifest.db")))
+
+    registered = tools.register_tools(ctx)
+
+    # mesma fonte dos dois lados: o que o ctx falso capturou x o que o YAML diz
+    assert sorted(call["name"] for call in ctx.registrations) == sorted(registered)
+    assert sorted(manifest["provides_tools"]) == sorted(registered)
+    assert sorted(manifest["provides_tools"]) == sorted(tools.TOOL_NAMES)
+    assert set(manifest["provides_tools"]) == {
+        "db_list_connections",
+        "db_query",
+        "db_redis_command",
+    }
 
 
 def test_register_sobrevive_a_ctx_sem_nada():
