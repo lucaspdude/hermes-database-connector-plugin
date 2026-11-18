@@ -38,6 +38,13 @@ function collectText(node, out = []) {
   if (typeof node === 'object') {
     const props = node.props ?? {}
     collectText(props.children, out)
+    // Kit stubs don't render their props — surface common text props too
+    // (but never raw DOM attrs like a td's title tooltip).
+    if (node.sdk) {
+      for (const k of ['title', 'description', 'label']) {
+        if (typeof props[k] === 'string') out.push(props[k])
+      }
+    }
     // Function components render like React would — call them with their props
     // (their hooks are stubbed, so this is safe and repeatable).
     if (typeof node.type === 'function') collectText(node.type(props), out)
@@ -262,7 +269,7 @@ test('chip: consultas ativas e bancos', () => {
   registered()
   assert.match(text(render(StatusChip)), /1 query · 1 database/)
   // erro de backend → indicador de falha, não número congelado
-  setStubData({}, { isError: true })
+  setStubData(null, { isError: true })
   assert.match(text(render(StatusChip)), /unavailable/)
 })
 
@@ -274,6 +281,22 @@ test('settings: lista de conexões, secret_state e aviso de env var', () => {
   for (const label of ['Connections', 'New connection', 'Test', 'Edit', 'Delete', 'secret: missing', 'Settings ▸ Environment']) {
     assert.ok(raw.includes(label), 'falta label: ' + label)
   }
+})
+
+test('drivers: erro de transporte mostra Health unavailable', () => {
+  resetQueryCalls()
+  setStubData(null, { isError: true })
+  registered()
+  const raw = text(render(DriversPage))
+  assert.ok(raw.includes('Health unavailable'))
+})
+
+test('página: erro de backend total sem dados', () => {
+  resetQueryCalls()
+  setStubData(null, { isError: true })
+  registered()
+  const raw = text(render(ActivityPage))
+  assert.ok(raw.includes('Plugin backend unavailable'))
 })
 
 test('settings: drivers com comando de install e aviso de gateway', () => {

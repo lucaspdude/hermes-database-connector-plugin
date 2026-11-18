@@ -8,7 +8,7 @@
 // (same pattern as the bundled kanban plugin); components re-render on locale
 // switch, static surfaces (nav/palette) rebuild via ctx.i18n.onLocaleChange.
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
@@ -328,6 +328,15 @@ function readError(exc) {
   return null
 }
 
+// Last successfully fetched value — screens stay on stale-good data through
+// transient refetch failures instead of flashing error states (the chip/status
+// bar still signals the failure via dot tone).
+function useLastGood(value) {
+  const ref = useRef(null)
+  if (value !== null && value !== undefined) ref.current = value
+  return ref.current
+}
+
 // ---------------------------------------------------------------- helpers
 
 function parseOptions(row) {
@@ -405,7 +414,8 @@ function Section({ title, action, children }) {
 
 export function StatusChip() {
   const t = usePluginI18n(PLUGIN_ID)
-  const { data, isError } = useStatus()
+  const { data: fresh, isError } = useStatus()
+  const data = useLastGood(fresh)
   const active = Array.isArray(data?.active) ? data.active : []
   const byConn = new Map()
   for (const row of active) {
@@ -414,7 +424,7 @@ export function StatusChip() {
   const detail = byConn.size
     ? [...byConn].map(([id, n]) => t('chip.detailConn', n, id)).join(', ')
     : t('chip.detailNone')
-  const label = isError
+  const label = isError && data === null
     ? t('chip.unavailable')
     : t('chip.label', active.length, byConn.size)
   return jsxs('button', {
@@ -434,7 +444,7 @@ export function StatusChip() {
       cursor: 'pointer',
     },
     children: [
-      jsx(StatusDot, { key: 'dot', tone: isError ? 'bad' : active.length > 0 ? 'good' : 'muted' }),
+      jsx(StatusDot, { key: 'dot', tone: isError ? (data === null ? 'bad' : 'warn') : active.length > 0 ? 'good' : 'muted' }),
       label,
     ],
   })
@@ -498,12 +508,17 @@ export function ActivityPage() {
   const statusQ = useStatus()
   const queriesQ = useQueriesList()
   const connsQ = useConnections()
-  const active = Array.isArray(statusQ.data?.active) ? statusQ.data.active : []
-  const activeIds = useMemo(() => new Set(active.map((r) => r.connection_id)), [statusQ.data])
-  const queries = Array.isArray(queriesQ.data?.queries) ? queriesQ.data.queries : []
-  const connections = Array.isArray(connsQ.data?.connections) ? connsQ.data.connections : []
-  const statusFailed = statusQ.isError
-  const queriesFailed = queriesQ.isError
+  const statusData = useLastGood(statusQ.data)
+  const queriesData = useLastGood(queriesQ.data)
+  const connsData = useLastGood(connsQ.data)
+  const active = Array.isArray(statusData?.active) ? statusData.active : []
+  const activeIds = useMemo(() => new Set(active.map((r) => r.connection_id)), [statusData])
+  const queries = Array.isArray(queriesData?.queries) ? queriesData.queries : []
+  const connections = Array.isArray(connsData?.connections) ? connsData.connections : []
+  // A poll failure only surfaces when we never got data; with a last good
+  // snapshot the chip's warn dot is the failure signal (no flashing).
+  const statusFailed = statusQ.isError && statusData === null
+  const queriesFailed = queriesQ.isError && queriesData === null
   // Full-page error only when BOTH canonical reads fail (no flip-flopping when
   // a single endpoint hiccups); a single failure degrades to a banner.
   if (statusFailed && queriesFailed) {
@@ -924,8 +939,8 @@ function SecretStateBadge({ t, state }) {
 export function ConnectionsManager({ connections: connectionsProp }) {
   const t = usePluginI18n(PLUGIN_ID)
   const connsQ = useConnections()
-  const connections = connectionsProp ??
-    (Array.isArray(connsQ.data?.connections) ? connsQ.data.connections : [])
+  const fetched = useLastGood(Array.isArray(connsQ.data?.connections) ? connsQ.data.connections : null)
+  const connections = connectionsProp ?? fetched ?? []
   const [editing, setEditing] = useState(null) // null | 'new' | connection row
   const [deleting, setDeleting] = useState(null)
   const [tests, setTests] = useState({}) // id -> 'busy' | 'ok (12 ms)' | error string
@@ -1055,7 +1070,7 @@ export function ConnectionsManager({ connections: connectionsProp }) {
 export function DriversPage({ health }) {
   const t = usePluginI18n(PLUGIN_ID)
   const healthQ = useHealth()
-  const engines = health?.engines ?? healthQ.data?.engines
+  const engines = health?.engines ?? healthQ.data?.engines ?? useLastGood(healthQ.data?.engines)
   if (!engines) {
     if (healthQ.isError) {
       const detail = readError(healthQ.error)
