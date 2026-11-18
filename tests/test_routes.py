@@ -898,6 +898,41 @@ def test_every_failure_is_error_and_detail_without_any_app_handler(tmp_path, mon
         conn.close()
 
 
+def test_store_self_configures_from_host_storage_when_not_injected(tmp_path, monkeypatch):
+    """O web server monta o router SEM configure(ctx): get_store tem que se
+    autoconfigurar via plugins.plugin_storage (padrao dos plugins bundled).
+    Sem isso, toda rota do dashboard responde 503 store_unavailable.
+    """
+    import sys
+    import types
+    import sqlite3
+
+    from dashboard import plugin_api
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient as _TestClient
+
+    plugin_api.set_store(None)
+    db_file = str(tmp_path / "connector.db")
+
+    fake = types.ModuleType("hermes_cli.plugins.plugin_storage")
+    fake.plugin_db = lambda name, filename: sqlite3.connect(db_file)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins.plugin_storage", fake)
+
+    app = FastAPI()
+    app.include_router(plugin_api.router, prefix=PREFIX)
+    test_client = _TestClient(app)
+
+    try:
+        response = test_client.get(f"{PREFIX}/connections")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body.get("ok") is True and "connections" in body
+        # o store autoconfigurado persiste no modulo (mesma rota depois)
+        assert test_client.get(f"{PREFIX}/status").status_code == 200
+    finally:
+        plugin_api.set_store(None)
+
+
 def test_contract_holds_for_unusual_verbs_trailing_slash_and_head(tmp_path):
     """TRACE, barra final e HEAD tambem respeitam {error, detail}/o recurso.
 
