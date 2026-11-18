@@ -113,15 +113,36 @@ def set_store(store: Any | None) -> None:
         _store = service.canonical_store(store)
 
 
+def _self_configure_from_host_storage() -> None:
+    """Wire the store straight from the host's plugin storage (dashboard half).
+
+    The web server imports this module and mounts the router WITHOUT any
+    ``register(ctx)`` — nothing on the host ever calls :func:`configure` for the
+    dashboard half, so an injection-only wiring left every route answering 503
+    ``store_unavailable`` (observed in production, 2026-11-18). The bundled
+    plugins solve this the same way: import the allowlisted
+    ``plugins.plugin_storage`` themselves. Same db file the agent half uses
+    (canonical path → each operation opens its own connection).
+    """
+    try:
+        set_store(service.init_store(None))
+    except Exception:  # noqa: BLE001 - outside Hermes: keep the clean 503
+        set_store(None)
+
+
 def get_store() -> Any:
     """Return the configured store (its db path), or fail cleanly when not wired.
 
     Never re-opened here: handing a connection to a route would be handing one
-    shared object to every threadpool thread.
+    shared object to every threadpool thread. Self-configures from the host's
+    plugin storage when nothing was injected (see
+    :func:`_self_configure_from_host_storage`).
     """
     global _store
     if _store is None and _store_factory is not None:
         _store = service.canonical_store(_store_factory())
+    if _store is None:
+        _self_configure_from_host_storage()
     if _store is None:
         raise _HttpError(
             503,
